@@ -1,0 +1,212 @@
+name: 🤖 Run Live Trading Bot
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trigger: manual only (workflow_dispatch)
+# All credentials are stored as GitHub Secrets — never hardcoded.
+#
+# Required Secrets  (Settings → Secrets and variables → Actions):
+#   UPSTOX_ACCESS_TOKEN   — Upstox API access token (refresh daily before run)
+#   TELEGRAM_BOT_TOKEN    — Telegram bot token from @BotFather
+#   TELEGRAM_CHAT_ID      — Your Telegram chat / channel ID
+#
+# Optional env var (set via dispatch input):
+#   VIRTUAL_MODE          — "true" = paper trade (default), "false" = live orders
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      virtual_mode:
+        description: "Virtual trading mode? (true = paper trade, false = live orders)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      sbt_period:
+        description: "SBT period (default: 12)"
+        required: false
+        default: "12"
+      sbt_mult:
+        description: "SBT multiplier (default: 2.0)"
+        required: false
+        default: "2.0"
+      run_duration_hours:
+        description: "Max runtime in hours before auto-stop (default: 7)"
+        required: false
+        default: "7"
+
+jobs:
+  run-bot:
+    name: Nifty 50 SBT Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 480   # hard ceiling: 8 hours
+
+    env:
+      # ── Credentials from GitHub Secrets ──────────────────────────────────────
+      UPSTOX_ACCESS_TOKEN:  ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # ── Runtime parameters from dispatch inputs ───────────────────────────────
+      VIRTUAL_MODE:         ${{ github.event.inputs.virtual_mode }}
+      SBT_PERIOD:           ${{ github.event.inputs.sbt_period }}
+      SBT_MULT:             ${{ github.event.inputs.sbt_mult }}
+      RUN_DURATION_HOURS:   ${{ github.event.inputs.run_duration_hours }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ──────────────────────────────────────────────
+      - name: 📦 Install dependencies
+        working-directory: "live bot"
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Validate secrets are present ─────────────────────────────────────
+      - name: 🔐 Validate required secrets
+        run: |
+          python - <<'EOF'
+          import os, sys, datetime
+
+          missing = []
+          for var in ["UPSTOX_ACCESS_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+              if not os.environ.get(var):
+                  missing.append(var)
+          if missing:
+              print(f"❌ ERROR: Missing required secrets: {', '.join(missing)}")
+              print("   Add them via: Settings → Secrets and variables → Actions")
+              sys.exit(1)
+
+          # Detect late-start scenario and log it
+          now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+          market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+          late_start  = now_ist > market_open
+
+          print("✅ All required secrets are present.")
+          print(f"   Virtual mode : {os.environ.get('VIRTUAL_MODE', 'true')}")
+          print(f"   SBT period   : {os.environ.get('SBT_PERIOD', '12')}")
+          print(f"   SBT mult     : {os.environ.get('SBT_MULT', '2.0')}")
+          print(f"   Max runtime  : {os.environ.get('RUN_DURATION_HOURS', '7')} hours")
+          print(f"   IST now      : {now_ist.strftime('%H:%M')}")
+          if late_start:
+              mins = int((now_ist - market_open).total_seconds() // 60)
+              print(f"   ⚡ Late start : {mins} min after market open — intraday_data.py will prefetch missed candles.")
+          else:
+              print(f"   ✅ On-time start : WebSocket will build all candles from scratch.")
+          EOF
+
+      # ── 5. Telegram: Bot started ─────────────────────────────────────────────
+      - name: 📣 Notify Telegram — Bot Started
+        run: |
+          python - <<'EOF'
+          import os, requests, datetime
+
+          token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not token or not chat_id:
+              print("Telegram credentials missing — skipping.")
+              exit(0)
+
+          # IST time
+          now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+          now_str = now_ist.strftime("%Y-%m-%d %H:%M IST")
+
+          market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+          late_start  = now_ist > market_open
+          if late_start:
+              mins       = int((now_ist - market_open).total_seconds() // 60)
+              seed_label = f"⚡ Late start (+{mins}min) — prefetching missed candles"
+          else:
+              seed_label = "✅ On-time — WebSocket builds data from scratch"
+
+          run_url = (
+              f"https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}"
+              f"/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}"
+          )
+          virtual = os.environ.get("VIRTUAL_MODE", "true")
+          period  = os.environ.get("SBT_PERIOD", "12")
+          mult    = os.environ.get("SBT_MULT", "2.0")
+          hours   = os.environ.get("RUN_DURATION_HOURS", "7")
+          mode_emoji = "🔵" if virtual == "true" else "🟢"
+          mode_label = "VIRTUAL (paper trade)" if virtual == "true" else "LIVE (real orders)"
+
+          text = (
+              f"🚀 *Nifty SBT Bot STARTED*\n"
+              f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              f"🕐 Time      : `{now_str}`\n"
+              f"{mode_emoji} Mode      : `{mode_label}`\n"
+              f"📊 Strategy  : SBT  period=`{period}`  mult=`{mult}`\n"
+              f"🕯 Candle    : `5 min` (NIFTY)  |  `1 min` (Option monitor)\n"
+              f"⏱  Max run   : `{hours}` hours\n"
+              f"🎯 Target    : `+₹600`  |  🛑 SL : `-₹300`\n"
+              f"📡 Seed      : {seed_label}\n"
+              f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              f"🔗 [View run]({run_url})"
+          )
+
+          resp = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+              timeout=10,
+          )
+          print(f"Telegram start notify: HTTP {resp.status_code}")
+          EOF
+
+      # ── 6. Run the bot ───────────────────────────────────────────────────────
+      - name: 🤖 Run websocket.py
+        id: run_bot
+        working-directory: "live bot"
+        run: |
+          timeout "${RUN_DURATION_HOURS}h" python websocket.py 2>&1 || true
+
+      # ── 7. Telegram: Bot stopped ─────────────────────────────────────────────
+      - name: 📣 Notify Telegram — Bot Stopped
+        if: always()
+        env:
+          BOT_OUTCOME: ${{ steps.run_bot.outcome }}
+        run: |
+          python - <<'EOF'
+          import os, requests, datetime
+
+          token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not token or not chat_id:
+              print("Telegram credentials missing — skipping.")
+              exit(0)
+
+          outcome = os.environ.get("BOT_OUTCOME", "unknown")
+          now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+          now_str = now_ist.strftime("%Y-%m-%d %H:%M IST")
+          run_url = (
+              f"https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}"
+              f"/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}"
+          )
+          emoji = "✅" if outcome == "success" else ("❌" if outcome == "failure" else "⚫")
+          text = (
+              f"{emoji} *Nifty SBT Bot STOPPED*\n"
+              f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              f"🕐 Time   : `{now_str}`\n"
+              f"📋 Status : `{outcome}`\n"
+              f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              f"🔗 [View run]({run_url})"
+          )
+
+          resp = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+              timeout=10,
+          )
+          print(f"Telegram stop notify: HTTP {resp.status_code}")
+          EOF

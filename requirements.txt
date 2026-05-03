@@ -1,0 +1,9 @@
+# Live Bot — Python dependencies
+# Generated for Python 3.11 / GitHub Actions (ubuntu-latest)
+
+upstox-python-sdk   # Upstox API client (includes protobuf market-data feed)
+websockets>=12.0    # Async WebSocket client
+pandas>=2.0         # DataFrame + OHLC processing
+numpy>=1.26         # Numerical ops (SBT indicator)
+requests>=2.31      # HTTP calls (Telegram, REST auth)
+python-dotenv>=1.0  # Load .env file for local dev (optional, safe to skip in CI)
