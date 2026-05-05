@@ -66,13 +66,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "live bot/requirements.txt"
+          cache-dependency-path: "requirements.txt"
 
       # ── 3. Install dependencies ──────────────────────────────────────────────
       - name: 📦 Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r "$GITHUB_WORKSPACE/live bot/requirements.txt"
+          pip install -r requirements.txt
 
       # ── 4. Validate secrets are present ─────────────────────────────────────
       - name: 🔐 Validate required secrets
@@ -168,7 +168,6 @@ jobs:
       - name: 🤖 Run websocket.py
         id: run_bot
         run: |
-          cd "$GITHUB_WORKSPACE/live bot"
           timeout "${RUN_DURATION_HOURS}h" python websocket.py 2>&1 || true
 
       # ── 7. Telegram: Bot stopped ─────────────────────────────────────────────
