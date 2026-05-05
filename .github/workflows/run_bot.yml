@@ -66,21 +66,18 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: "live bot/requirements.txt"
 
       # ── 3. Install dependencies ──────────────────────────────────────────────
       - name: 📦 Install dependencies
         run: |
           pip install --upgrade pip
-          # Install requests globally first so inline Python steps can import it
-          pip install requests
-          # Install all project dependencies from requirements.txt
-          cd "$GITHUB_WORKSPACE/live bot"
-          pip install -r requirements.txt
+          pip install -r "$GITHUB_WORKSPACE/live bot/requirements.txt"
 
       # ── 4. Validate secrets are present ─────────────────────────────────────
       - name: 🔐 Validate required secrets
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import os, sys, datetime
 
           missing = []
@@ -108,12 +105,12 @@ jobs:
               print(f"   ⚡ Late start : {mins} min after market open — intraday_data.py will prefetch missed candles.")
           else:
               print(f"   ✅ On-time start : WebSocket will build all candles from scratch.")
-          EOF
+          PYEOF
 
       # ── 5. Telegram: Bot started ─────────────────────────────────────────────
       - name: 📣 Notify Telegram — Bot Started
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import os, requests, datetime
 
           token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -165,7 +162,7 @@ jobs:
               timeout=10,
           )
           print(f"Telegram start notify: HTTP {resp.status_code}")
-          EOF
+          PYEOF
 
       # ── 6. Run the bot ───────────────────────────────────────────────────────
       - name: 🤖 Run websocket.py
@@ -180,7 +177,7 @@ jobs:
         env:
           BOT_OUTCOME: ${{ steps.run_bot.outcome }}
         run: |
-          python - <<'EOF'
+          python - <<'PYEOF'
           import os, requests, datetime
 
           token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -212,4 +209,4 @@ jobs:
               timeout=10,
           )
           print(f"Telegram stop notify: HTTP {resp.status_code}")
-          EOF
+          PYEOF
