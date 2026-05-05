@@ -69,8 +69,8 @@ jobs:
 
       # ── 3. Install dependencies ──────────────────────────────────────────────
       - name: 📦 Install dependencies
-        working-directory: "live bot"
         run: |
+          cd "$GITHUB_WORKSPACE/live bot"
           pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -167,8 +167,8 @@ jobs:
       # ── 6. Run the bot ───────────────────────────────────────────────────────
       - name: 🤖 Run websocket.py
         id: run_bot
-        working-directory: "live bot"
         run: |
+          cd "$GITHUB_WORKSPACE/live bot"
           timeout "${RUN_DURATION_HOURS}h" python websocket.py 2>&1 || true
 
       # ── 7. Telegram: Bot stopped ─────────────────────────────────────────────
