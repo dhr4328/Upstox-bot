@@ -23,7 +23,8 @@ import requests
 import websockets
 
 from config import access_token, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-from order_manager import place_option_order
+# order_manager is imported lazily inside run_strategy_and_print()
+# to avoid circular-import issues at module load time.
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -231,6 +232,7 @@ async def run_strategy_and_print(label: str = ""):
             )
             # ── Place option order (non-blocking — runs in background thread) ──
             import threading
+            from order_manager import place_option_order   # lazy import
             threading.Thread(
                 target = place_option_order,
                 args   = (sig, close, ts_s),
@@ -242,10 +244,10 @@ async def run_strategy_and_print(label: str = ""):
     return df
 
 
-# ── Storage (populated at startup) ────────────────────────────────────────────
+# ── Storage (populated at startup inside __main__) ───────────────────────────
 
-candles_5m  = load_historical_buffer()   # completed candles (hist + live)
-open_candle = {}                         # current in-progress live candle
+candles_5m  = []   # completed candles (hist + live) — filled in __main__
+open_candle = {}   # current in-progress live candle
 
 # ── Step 2 : Get the WebSocket URL ────────────────────────────────────────────
 
@@ -392,6 +394,8 @@ async def run():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── Initialise candle buffer (must happen before WebSocket starts) ────────
+    candles_5m = load_historical_buffer()
     print("=" * 60)
     print("  Upstox  |  Nifty 50  |  1-Minute OHLC  (Live + Historical)")
     print("  Strategy : Super Bollinger Trend  (period=12, mult=2.0)")
