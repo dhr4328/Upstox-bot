@@ -90,8 +90,7 @@ _active_trade = None   # None when no position is open
 
 def _send_telegram(text: str):
     """Post a message to the configured Telegram chat (best-effort)."""
-    if (TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE"
-            or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE"):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[TELEGRAM] Credentials not configured — skipping.")
         return
     url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"

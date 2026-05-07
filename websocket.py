@@ -39,7 +39,7 @@ async def send_telegram_alert(signal: str, close: float, sbt: float, ts_str: str
     Send a formatted signal alert to the configured Telegram chat.
     Silently swallows errors so the main loop is never interrupted.
     """
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[TELEGRAM] Credentials not set — skipping alert.")
         return
 
@@ -181,14 +181,31 @@ def superBoilingerTrend(df, period=12, mult=2.0):
     return df
 
 
-async def run_strategy_and_print(label: str = ""):
+async def run_strategy_and_print(label: str = "", closed_only: bool = False):
     """
-    Build the full OHLC DataFrame, run SuperBoilingerTrend on it,
+    Build the OHLC DataFrame, run SuperBoilingerTrend on it,
     print the latest signal, and send a Telegram alert if the
     freshest closed candle itself generated the signal.
+
+    closed_only=True  → use only completed candles (candles_5m), no open candle.
+                         Used on every live candle-close so the just-closed candle
+                         is always df.index[-1] and signal detection is correct.
+    closed_only=False → use get_full_df() which includes the in-progress candle.
+                         Used for the startup historical scan.
+
     Returns the strategy-applied DataFrame.
     """
-    df = get_full_df()
+    if closed_only:
+        # Build df from completed candles only — avoids the in-progress open_candle
+        # being appended as the last row and breaking the last_idx check.
+        rows = list(candles_5m)
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df.sort_values("time").reset_index(drop=True)
+    else:
+        df = get_full_df()
+
     if df.empty or len(df) < 13:   # need at least period+1 rows
         return df
 
@@ -211,12 +228,13 @@ async def run_strategy_and_print(label: str = ""):
             f"@ {ts_s}  Close={last['Close']:.2f}  SBT={last['SBT']:.2f}"
         )
 
-        # ── Fire Telegram alert + option order when latest candle fires a signal
+        # ── Fire Telegram alert + option order only when the LAST ROW fired the signal
+        # When closed_only=True, df.index[-1] is always the just-closed candle.
         last_idx = df.index[-1]
         if sig_rows.index[-1] == last_idx:
             sig   = last['Signal']
             close = float(last['Close'])
-            arrow = "▲" if sig == "LONG" else "▼"
+            arrow = "\u25b2" if sig == "LONG" else "\u25bc"
             print(
                 f"  {'='*55}\n"
                 f"  {arrow}  LIVE SIGNAL : {sig}  |  Close={close:.2f}"
@@ -345,10 +363,17 @@ def update_candle(ltp: float):
             f"[Total: {len(candles_5m)}]"
         )
 
-        # ── Run strategy on every candle close ────────────────────────────────
-        asyncio.ensure_future(run_strategy_and_print(label=c['time'].strftime('%H:%M')))
+        # ── Run strategy BEFORE opening new candle so candles_5m[-1] is the
+        #    just-closed row and closed_only=True makes it df.index[-1]. ─────
+        asyncio.get_event_loop().create_task(
+            run_strategy_and_print(
+                label       = c['time'].strftime('%H:%M'),
+                closed_only = True,   # ← ensures signal check works correctly
+            )
+        )
 
-        # Open the next candle
+        # Open the next candle (after scheduling strategy so it doesn't appear
+        # in the closed-only df used by the strategy task above)
         open_candle = {
             "time": candle_ts, "open": ltp, "high": ltp,
             "low": ltp, "close": ltp, "source": "live",
