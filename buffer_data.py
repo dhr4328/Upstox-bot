@@ -15,7 +15,7 @@ import datetime
 import pandas as pd
 import upstox_client
 
-from config import access_token
+from config import access_token, data_token
 
 # ── Instrument (must match websocket.py) ──────────────────────────────────────
 
@@ -24,7 +24,7 @@ INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 # ── Upstox API client ─────────────────────────────────────────────────────────
 
 configuration = upstox_client.Configuration()
-configuration.access_token = access_token
+configuration.access_token = data_token if data_token else access_token
 _client = upstox_client.ApiClient(configuration)
 
 hist_api     = upstox_client.HistoryV3Api(_client)

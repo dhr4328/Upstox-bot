@@ -27,7 +27,7 @@ import datetime
 import pandas as pd
 import upstox_client
 
-from config import access_token
+from config import access_token, data_token
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ MARKET_OPEN    = datetime.time(9, 15)   # 09:15 IST
 # ── Upstox API client ─────────────────────────────────────────────────────────
 
 _configuration             = upstox_client.Configuration()
-_configuration.access_token = access_token
+_configuration.access_token = data_token if data_token else access_token
 _client                    = upstox_client.ApiClient(_configuration)
 _intraday_api              = upstox_client.HistoryV3Api(_client)
 

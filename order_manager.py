@@ -38,7 +38,7 @@ import requests
 import upstox_client
 from upstox_client.rest import ApiException
 
-from config import access_token, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import access_token, data_token, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE SWITCH  —  controlled by VIRTUAL_MODE environment variable
@@ -63,16 +63,22 @@ NIFTY_STEP           = 50      # NIFTY strike step in index points
 OPTION_POLL_INTERVAL = 62      # seconds between 1-min candle polls
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Upstox SDK client  (used for market data queries only in virtual mode)
+# Upstox SDK clients (General Purpose & Data Analytics)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# General purpose client (WebSockets, Orders, Live Quotes)
 _cfg              = upstox_client.Configuration()
 _cfg.access_token = access_token
 _api_client       = upstox_client.ApiClient(_cfg)
 
-_options_api      = upstox_client.OptionsApi(_api_client)
+# Data analytics client (Options Chain, Historical Data)
+_data_cfg              = upstox_client.Configuration()
+_data_cfg.access_token = data_token if data_token else access_token
+_data_api_client       = upstox_client.ApiClient(_data_cfg)
+
+_options_api      = upstox_client.OptionsApi(_data_api_client)
 _market_quote_api = upstox_client.MarketQuoteApi(_api_client)
-_history_api      = upstox_client.HistoryV3Api(_api_client)
+_history_api      = upstox_client.HistoryV3Api(_data_api_client)
 
 # Only instantiated when VIRTUAL_MODE is False
 _order_api = upstox_client.OrderApiV3(_api_client)

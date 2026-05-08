@@ -6,6 +6,7 @@ name: 🤖 Run Live Trading Bot
 #
 # Required Secrets  (Settings → Secrets and variables → Actions):
 #   UPSTOX_ACCESS_TOKEN   — Upstox API access token (refresh daily before run)
+#   UPSTOX_DATA_TOKEN     — Upstox API token for data analytics & option chain fetching
 #   TELEGRAM_BOT_TOKEN    — Telegram bot token from @BotFather
 #   TELEGRAM_CHAT_ID      — Your Telegram chat / channel ID
 #
@@ -46,6 +47,7 @@ jobs:
     env:
       # ── Credentials from GitHub Secrets ──────────────────────────────────────
       UPSTOX_ACCESS_TOKEN:  ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+      UPSTOX_DATA_TOKEN:    ${{ secrets.UPSTOX_DATA_TOKEN }}
       TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -81,7 +83,7 @@ jobs:
           import os, sys, datetime
 
           missing = []
-          for var in ["UPSTOX_ACCESS_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+          for var in ["UPSTOX_ACCESS_TOKEN", "UPSTOX_DATA_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
               if not os.environ.get(var):
                   missing.append(var)
           if missing:

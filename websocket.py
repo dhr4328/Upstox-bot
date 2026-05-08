@@ -270,6 +270,12 @@ open_candle = {}   # current in-progress live candle
 # ── Step 2 : Get the WebSocket URL ────────────────────────────────────────────
 
 def get_ws_url():
+    if not access_token:
+        raise RuntimeError(
+            "UPSTOX_ACCESS_TOKEN is not set or is empty. "
+            "Add it as a GitHub Secret (Settings → Secrets and variables → Actions) "
+            "or export it in your shell before running."
+        )
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept":        "application/json",

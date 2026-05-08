@@ -32,9 +32,10 @@ except ImportError:
 
 # ── Read credentials from environment ────────────────────────────────────────
 
-access_token       = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+access_token       = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+data_token         = os.environ.get("UPSTOX_DATA_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # ── Validate at startup ───────────────────────────────────────────────────────
 
@@ -42,6 +43,8 @@ _missing = []
 
 if not access_token:
     _missing.append("UPSTOX_ACCESS_TOKEN")
+if not data_token:
+    _missing.append("UPSTOX_DATA_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     _missing.append("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_CHAT_ID:
