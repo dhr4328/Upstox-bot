@@ -63,22 +63,16 @@ NIFTY_STEP           = 50      # NIFTY strike step in index points
 OPTION_POLL_INTERVAL = 62      # seconds between 1-min candle polls
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Upstox SDK clients (General Purpose & Data Analytics)
+# Upstox SDK client  —  single access_token (official snippet pattern)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# General purpose client (WebSockets, Orders, Live Quotes)
 _cfg              = upstox_client.Configuration()
-_cfg.access_token = access_token
+_cfg.access_token = access_token          # single token for all APIs
 _api_client       = upstox_client.ApiClient(_cfg)
 
-# Data analytics client (Options Chain, Historical Data)
-_data_cfg              = upstox_client.Configuration()
-_data_cfg.access_token = data_token if data_token else access_token
-_data_api_client       = upstox_client.ApiClient(_data_cfg)
-
-_options_api      = upstox_client.OptionsApi(_data_api_client)
+_options_api      = upstox_client.OptionsApi(_api_client)
 _market_quote_api = upstox_client.MarketQuoteApi(_api_client)
-_history_api      = upstox_client.HistoryV3Api(_data_api_client)
+_history_api      = upstox_client.HistoryV3Api(_api_client)
 
 # Only instantiated when VIRTUAL_MODE is False
 _order_api = upstox_client.OrderApiV3(_api_client)
@@ -173,41 +167,78 @@ def _alert_trade_result(signal: str, option_type: str, strike: int,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Expiry date helper
+# Expiry date — fetched dynamically from Upstox get_option_contracts
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _nearest_thursday(base: datetime.date) -> datetime.date:
-    """Return the nearest upcoming Thursday (inclusive of base)."""
-    days = (3 - base.weekday()) % 7
-    return base + datetime.timedelta(days=days)
-
 
 def get_expiry_date() -> str:
-    """Nearest NIFTY weekly expiry as 'YYYY-MM-DD'."""
-    now    = datetime.datetime.now()
-    today  = now.date()
-    expiry = _nearest_thursday(today)
-    # If today is Thursday and market is closed, roll to next Thursday
-    if expiry == today and now.hour >= 15 and now.minute >= 30:
-        expiry = _nearest_thursday(today + datetime.timedelta(days=1))
-    return expiry.strftime("%Y-%m-%d")
+    """
+    Fetches the list of available expiry dates for NIFTY options directly
+    from the Upstox get_option_contracts API and returns the nearest
+    upcoming one as 'YYYY-MM-DD'.
+
+    This is exchange-driven — no hard-coded day-of-week logic, so it
+    remains correct regardless of future NSE expiry day changes.
+    """
+    try:
+        resp = _options_api.get_option_contracts("NSE_INDEX|Nifty 50")
+    except ApiException as exc:
+        raise RuntimeError(f"get_option_contracts API error: {exc}") from exc
+
+    if not resp or not resp.data:
+        raise RuntimeError("get_option_contracts returned no data — check access_token scope.")
+
+    today = datetime.date.today()
+
+    # Collect unique expiry dates that are >= today
+    expiries = set()
+    for contract in resp.data:
+        raw = getattr(contract, "expiry", None) or getattr(contract, "expiry_date", None)
+        if not raw:
+            continue
+        # raw may be a date object or a string like '2025-05-13'
+        if isinstance(raw, datetime.date):
+            exp_date = raw
+        else:
+            try:
+                exp_date = datetime.datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+        if exp_date >= today:
+            expiries.add(exp_date)
+
+    if not expiries:
+        raise RuntimeError(
+            f"No upcoming expiry dates found in get_option_contracts response "
+            f"(today={today}). Check your access_token."
+        )
+
+    nearest = min(expiries)
+    print(f"[ORDER] Available expiries (nearest 5): {sorted(expiries)[:5]}")
+    print(f"[ORDER] Selected expiry: {nearest}")
+    return nearest.strftime("%Y-%m-%d")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Option chain — resolve instrument key
+# Option chain — resolve instrument key  (official snippet pattern)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_option_instrument_key(
     nifty_ltp: float, option_type: str
 ) -> tuple[str, int, float, str]:
     """
-    Finds the ATM option contract for the nearest expiry.
+    Finds the ATM option contract for the nearest available expiry.
+
+    Flow
+    ----
+    1. Call get_option_contracts → extract nearest expiry from exchange data.
+    2. Call get_put_call_option_chain with that expiry (official snippet).
+    3. Return the ATM or nearest strike instrument key + metadata.
 
     Returns
     -------
     (instrument_key, strike, chain_ltp, expiry_date)
     """
-    expiry_date = get_expiry_date()
+    expiry_date = get_expiry_date()          # dynamically fetched from exchange
     atm_strike  = round(nifty_ltp / NIFTY_STEP) * NIFTY_STEP
 
     print(
@@ -215,16 +246,27 @@ def get_option_instrument_key(
         f"Type={option_type}  Expiry={expiry_date}"
     )
 
+    # ── Official snippet pattern ───────────────────────────────────────────────
+    configuration = upstox_client.Configuration()
+    configuration.access_token = access_token
+    api_instance = upstox_client.OptionsApi(upstox_client.ApiClient(configuration))
+
     try:
-        resp = _options_api.get_put_call_option_chain(
-            instrument_key="NSE_INDEX|Nifty 50",
-            expiry_date=expiry_date,
+        resp = api_instance.get_put_call_option_chain(
+            "NSE_INDEX|Nifty 50",
+            expiry_date,
         )
     except ApiException as exc:
         raise RuntimeError(f"Option chain API error: {exc}") from exc
 
     if not resp or not resp.data:
-        raise RuntimeError("Option chain response is empty.")
+        raise RuntimeError(
+            f"Option chain response is empty for expiry={expiry_date}. "
+            f"Verify the expiry date is valid and the access_token has "
+            f"Options data scope."
+        )
+
+    print(f"[ORDER] Option chain fetched — {len(resp.data)} strikes available.")
 
     # Build strike → {CE_key, CE_ltp, PE_key, PE_ltp}
     chain: dict[int, dict] = {}
@@ -238,7 +280,7 @@ def get_option_instrument_key(
             e["PE_key"] = row.put_options.instrument_key
             e["PE_ltp"] = float(row.put_options.market_data.ltp or 0)
 
-    # Try ATM, then ±50 fallbacks
+    # Try ATM, then ±1 strike fallbacks
     for s in [atm_strike, atm_strike + NIFTY_STEP, atm_strike - NIFTY_STEP]:
         if s in chain and f"{option_type}_key" in chain[s]:
             return (
@@ -251,7 +293,7 @@ def get_option_instrument_key(
     raise RuntimeError(
         f"No {option_type} found near strike {atm_strike} "
         f"for expiry {expiry_date}. "
-        f"Available: {sorted(chain)[:10]}"
+        f"Available strikes: {sorted(chain)[:10]}"
     )
 
 
