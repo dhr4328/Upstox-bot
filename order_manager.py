@@ -195,8 +195,12 @@ def get_expiry_date() -> str:
         raw = getattr(contract, "expiry", None) or getattr(contract, "expiry_date", None)
         if not raw:
             continue
-        # raw may be a date object or a string like '2025-05-13'
-        if isinstance(raw, datetime.date):
+        # raw can be datetime.datetime, datetime.date, or a string like '2025-05-13'
+        # IMPORTANT: check datetime.datetime BEFORE datetime.date because
+        # datetime.datetime is a subclass of datetime.date — isinstance(dt, date) == True
+        if isinstance(raw, datetime.datetime):
+            exp_date = raw.date()          # strip time component
+        elif isinstance(raw, datetime.date):
             exp_date = raw
         else:
             try:
