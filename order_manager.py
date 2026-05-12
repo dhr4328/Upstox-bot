@@ -61,6 +61,42 @@ TARGET_PNL           = 600     # ₹ profit target per trade
 SL_PNL               = -300    # ₹ stop-loss per trade (negative)
 NIFTY_STEP           = 50      # NIFTY strike step in index points
 OPTION_POLL_INTERVAL = 62      # seconds between 1-min candle polls
+IST_TZ               = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _ist_now() -> datetime.datetime:
+    """Current timezone-aware IST datetime."""
+    return datetime.datetime.now(IST_TZ)
+
+
+def _to_ist_naive_datetime(value):
+    """Normalize datetime-like values to naive IST datetime for formatting."""
+    if value is None:
+        return None
+
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(IST_TZ).replace(tzinfo=None)
+
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(IST_TZ).replace(tzinfo=None)
+
+
+def _format_ist_timestamp(value, fmt: str = "%d-%b-%Y %H:%M:%S IST") -> str:
+    dt = _to_ist_naive_datetime(value)
+    if dt is None:
+        return str(value)
+    return dt.strftime(fmt)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Upstox SDK client  —  single access_token (official snippet pattern)
@@ -116,6 +152,8 @@ def _alert_signal_entry(signal: str, option_type: str, strike: int,
     target = entry_price + (TARGET_PNL / LOT_SIZE)
     sl_px  = entry_price + (SL_PNL    / LOT_SIZE)
 
+    signal_time_ist = _format_ist_timestamp(signal_time)
+
     text = (
         f"{arrow} *SBT Signal — Option Selected* {mode}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -129,7 +167,7 @@ def _alert_signal_entry(signal: str, option_type: str, strike: int,
         f"🎯 Target      : `₹{target:.2f}` (+₹{TARGET_PNL})\n"
         f"🛑 Stop Loss   : `₹{sl_px:.2f}` (₹{SL_PNL})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ Signal Time : `{signal_time}`"
+        f"⏰ Signal Time : `{signal_time_ist}`"
     )
     print(f"\n[TELEGRAM] Sending Alert 1 — Signal Entry")
     _send_telegram(text)
@@ -147,6 +185,9 @@ def _alert_trade_result(signal: str, option_type: str, strike: int,
     emoji      = "🎯" if exit_reason == "TARGET" else "🛑"
     mode       = "🔵 VIRTUAL" if VIRTUAL_MODE else "🟢 LIVE"
 
+    signal_time_ist = _format_ist_timestamp(signal_time)
+    exit_ts_ist = _format_ist_timestamp(exit_ts)
+
     text = (
         f"{emoji} *Trade Closed — {exit_reason} HIT* {mode}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -159,8 +200,8 @@ def _alert_trade_result(signal: str, option_type: str, strike: int,
         f"💼 Net P&L     : *₹{pnl:+.2f}*  ({LOT_SIZE} shares)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 Result      : *{result_tag}*\n"
-        f"⏰ Exit Time   : `{exit_ts}`\n"
-        f"⏰ Signal Time : `{signal_time}`"
+        f"⏰ Exit Time   : `{exit_ts_ist}`\n"
+        f"⏰ Signal Time : `{signal_time_ist}`"
     )
     print(f"\n[TELEGRAM] Sending Alert 2 — Trade Result  ({result_tag})")
     _send_telegram(text)
@@ -187,7 +228,7 @@ def get_expiry_date() -> str:
     if not resp or not resp.data:
         raise RuntimeError("get_option_contracts returned no data — check access_token scope.")
 
-    today = datetime.date.today()
+    today = _ist_now().date()
 
     # Collect unique expiry dates that are >= today
     expiries = set()
@@ -393,107 +434,136 @@ def _monitor_trade(trade: dict):
     Runs in a background daemon thread.
 
     Every OPTION_POLL_INTERVAL seconds:
-      1. Fetch the latest 1-min intraday candles for the option.
-      2. Use the most-recent closed candle's CLOSE as the current price.
-      3. P&L = (close − entry_price) × LOT_SIZE
-      4. TARGET_PNL hit → send Alert 2 (PROFIT) and close.
-         SL_PNL     hit → send Alert 2 (LOSS)   and close.
-
-    trade keys:
-        instrument_key, strike, option_type, entry_price,
-        expiry_date, signal, signal_time
+      1. Fetch latest 1-min option candles.
+      2. Detect target/SL hits using candle HIGH/LOW (not just close).
+      3. Square off and release the active-trade slot.
     """
     global _active_trade
 
-    instr      = trade["instrument_key"]
-    entry      = trade["entry_price"]
-    opt_type   = trade["option_type"]
-    strike     = trade["strike"]
-    sig_t      = trade["signal_time"]
-    signal     = trade["signal"]
+    instr    = trade["instrument_key"]
+    entry    = float(trade["entry_price"])
+    opt_type = trade["option_type"]
+    strike   = trade["strike"]
+    sig_t    = trade["signal_time"]
+    signal   = trade["signal"]
+
+    target_px = entry + (TARGET_PNL / LOT_SIZE)
+    sl_px     = entry + (SL_PNL / LOT_SIZE)
 
     print(
-        f"[MONITOR] Started  —  {opt_type} {strike}  "
-        f"Entry=₹{entry:.2f}  Target=+₹{TARGET_PNL}  SL=₹{SL_PNL}\n"
-        f"[MONITOR] Polling 1-min option candles every {OPTION_POLL_INTERVAL}s …"
+        f"[MONITOR] Started - {opt_type} {strike}  "
+        f"Entry=Rs.{entry:.2f}  Target=Rs.{target_px:.2f}  SL=Rs.{sl_px:.2f}\n"
+        f"[MONITOR] Polling 1-min option candles every {OPTION_POLL_INTERVAL}s ..."
     )
 
     last_candle_ts = None
+    trade_closed = False
 
-    while True:
-        time.sleep(OPTION_POLL_INTERVAL)
+    try:
+        while True:
+            time.sleep(OPTION_POLL_INTERVAL)
 
-        candles = _get_option_1min_candles(instr)
-        if not candles:
-            print("[MONITOR] No candle data yet — will retry next interval.")
-            continue
+            candles = _get_option_1min_candles(instr)
+            if not candles:
+                print("[MONITOR] No candle data yet - will retry next interval.")
+                continue
 
-        latest = candles[-1]
-        ts     = latest["datetime"]
+            latest = candles[-1]
+            ts = latest["datetime"]
 
-        if ts == last_candle_ts:
-            print(f"[MONITOR] No new candle since {ts} — waiting …")
-            continue
+            if ts == last_candle_ts:
+                print(
+                    f"[MONITOR] No new candle since "
+                    f"{_format_ist_timestamp(ts, '%d-%b %H:%M:%S IST')} - waiting ..."
+                )
+                continue
 
-        last_candle_ts = ts
-        cur_close      = float(latest["close"])
-        pnl            = (cur_close - entry) * LOT_SIZE
+            last_candle_ts = ts
+            cur_open = float(latest["open"])
+            cur_high = float(latest["high"])
+            cur_low = float(latest["low"])
+            cur_close = float(latest["close"])
+            mark_pnl = (cur_close - entry) * LOT_SIZE
 
-        print(
-            f"[MONITOR] 1-min candle @ {ts}  "
-            f"O={latest['open']:.2f}  H={latest['high']:.2f}  "
-            f"L={latest['low']:.2f}  C={cur_close:.2f}  "
-            f"→ P&L = ₹{pnl:+.2f}"
-        )
+            print(
+                f"[MONITOR] 1-min candle @ "
+                f"{_format_ist_timestamp(ts, '%d-%b %H:%M:%S IST')}  "
+                f"O={cur_open:.2f}  H={cur_high:.2f}  L={cur_low:.2f}  C={cur_close:.2f}  "
+                f"-> Mark P&L = Rs.{mark_pnl:+.2f}"
+            )
 
-        exit_reason = None
-        if pnl >= TARGET_PNL:
-            exit_reason = "TARGET"
-        elif pnl <= SL_PNL:
-            exit_reason = "SL"
+            hit_target = cur_high >= target_px
+            hit_sl = cur_low <= sl_px
 
-        if exit_reason:
-            exit_ts = str(ts)
+            exit_reason = None
+            exit_price = None
 
-            # ── Square-off ──────────────────────────────────────────────────
+            if hit_target and hit_sl:
+                exit_reason = "SL"
+                exit_price = sl_px
+                print(
+                    "[MONITOR] Target and SL both touched in same candle; "
+                    "using SL as conservative assumption."
+                )
+            elif hit_target:
+                exit_reason = "TARGET"
+                exit_price = target_px
+            elif hit_sl:
+                exit_reason = "SL"
+                exit_price = sl_px
+
+            if exit_reason is None:
+                continue
+
+            pnl = (exit_price - entry) * LOT_SIZE
+            exit_ts = _format_ist_timestamp(ts)
+
             if VIRTUAL_MODE:
                 print(
                     f"[MONITOR] [{exit_reason}] VIRTUAL square-off  "
-                    f"Exit={cur_close:.2f}  P&L=₹{pnl:+.2f}"
+                    f"Exit={exit_price:.2f}  P&L=Rs.{pnl:+.2f}"
                 )
             else:
                 try:
                     sq_id = _place_real_order(instr, transaction_type="SELL")
                     print(f"[MONITOR] REAL square-off order_id={sq_id}")
                 except Exception as exc:
-                    print(f"[MONITOR] ⚠️  Square-off FAILED: {exc}")
+                    print(f"[MONITOR] Square-off FAILED: {exc}")
                     _send_telegram(
-                        f"⚠️ *Square-off FAILED*\n"
+                        f"Square-off FAILED\n"
                         f"Option : `{opt_type} {strike}`\n"
                         f"Error  : `{exc}`"
                     )
 
-            # ── Alert 2 — Trade result ───────────────────────────────────────
             _alert_trade_result(
-                signal      = signal,
-                option_type = opt_type,
-                strike      = strike,
-                entry_price = entry,
-                exit_price  = cur_close,
-                pnl         = pnl,
-                exit_reason = exit_reason,
-                exit_ts     = exit_ts,
-                signal_time = sig_t,
+                signal=signal,
+                option_type=opt_type,
+                strike=strike,
+                entry_price=entry,
+                exit_price=exit_price,
+                pnl=pnl,
+                exit_reason=exit_reason,
+                exit_ts=exit_ts,
+                signal_time=sig_t,
             )
-            break   # exit monitor loop
+            trade_closed = True
+            break
 
-    # Release trade slot
-    with _trade_lock:
-        _active_trade = None
-    print("[MONITOR] Trade closed — ready for next signal.\n")
+    except Exception as exc:
+        print(f"[MONITOR] Monitor crashed: {exc}")
+        _send_telegram(
+            f"Trade monitor crashed\n"
+            f"Option : `{opt_type} {strike}`\n"
+            f"Error  : `{exc}`"
+        )
+    finally:
+        with _trade_lock:
+            _active_trade = None
+        if trade_closed:
+            print("[MONITOR] Trade closed - ready for next signal.\n")
+        else:
+            print("[MONITOR] Monitor stopped - trade slot released for safety.\n")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Public entry point  (called by websocket.py on every fresh SBT signal)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -517,6 +587,7 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
     the running trade hits its TARGET or SL.
     """
     global _active_trade
+    signal_time = _format_ist_timestamp(signal_time)
 
     # ── Guard: skip if a trade is already running ──────────────────────────
     with _trade_lock:
@@ -552,7 +623,7 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
 
         # 3. Place order (virtual or real)
         if VIRTUAL_MODE:
-            order_id = f"VIRTUAL-{datetime.datetime.now().strftime('%H%M%S')}"
+            order_id = f"VIRTUAL-{_ist_now().strftime('%H%M%S')}"
             print(f"[ORDER] {mode_tag} BUY  NIFTY {strike} {option_type}  "
                   f"Qty={LOT_SIZE}  Price=₹{entry_price:.2f}  "
                   f"ref={order_id}")

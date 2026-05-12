@@ -20,6 +20,12 @@ from config import access_token, data_token
 # ── Instrument (must match websocket.py) ──────────────────────────────────────
 
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
+IST_TZ         = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _ist_now() -> datetime.datetime:
+    """Current timezone-aware IST datetime."""
+    return datetime.datetime.now(IST_TZ)
 
 # ── Upstox API client ─────────────────────────────────────────────────────────
 
@@ -55,8 +61,9 @@ def _candles_to_df(candles) -> pd.DataFrame:
 # Pass 1 : Historical closed sessions (last 5 calendar days → yesterday)
 # ─────────────────────────────────────────────────────────────────────────────
 
-today_str  = datetime.datetime.today().strftime("%Y-%m-%d")
-from_str   = (datetime.datetime.today() - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
+_now_ist   = _ist_now()
+today_str  = _now_ist.strftime("%Y-%m-%d")
+from_str   = (_now_ist - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
 
 hist_df = pd.DataFrame()
 try:

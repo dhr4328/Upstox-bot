@@ -33,6 +33,16 @@ from config import access_token, data_token
 
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 MARKET_OPEN    = datetime.time(9, 15)   # 09:15 IST
+IST_TZ         = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _ist_now_naive() -> datetime.datetime:
+    """
+    Return current IST wall-clock time as a timezone-naive datetime.
+    Candle timestamps in this project are stored as naive IST values, so we
+    keep that convention for safe comparisons.
+    """
+    return datetime.datetime.now(IST_TZ).replace(tzinfo=None)
 
 # ── Upstox API client ─────────────────────────────────────────────────────────
 
@@ -76,7 +86,7 @@ def get_intraday_candles() -> list:
       • The API call fails.
       • No intraday data is available yet (pre-market / holiday).
     """
-    now     = datetime.datetime.now()
+    now     = _ist_now_naive()
     now_t   = now.time()
 
     # ── Case: Bot started at/before market open — skip entirely ──────────────
