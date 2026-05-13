@@ -1,5 +1,5 @@
 """
-buffer_data.py  —  Fetch 5-minute OHLC candles for Nifty 50.
+buffer_data.py  —  Fetch 1-minute OHLC candles for Nifty 50.
 
 Two-pass fetch:
   1. Historical API  → last N trading days (9:15 → 3:30, closed sessions)
@@ -68,7 +68,7 @@ from_str   = (_now_ist - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
 hist_df = pd.DataFrame()
 try:
     resp     = hist_api.get_historical_candle_data1(
-        INSTRUMENT_KEY, "minutes", "5", today_str, from_str
+        INSTRUMENT_KEY, "minutes", "1", today_str, from_str
     )
     hist_df  = _candles_to_df(resp.data.candles)
     hist_df  = hist_df.iloc[::-1].reset_index(drop=True)   # oldest first
@@ -86,7 +86,7 @@ except Exception as exc:
 
 intra_df = pd.DataFrame()
 try:
-    resp     = intraday_api.get_intra_day_candle_data(INSTRUMENT_KEY, "5minute")
+    resp     = intraday_api.get_intra_day_candle_data(INSTRUMENT_KEY, "1minute")
     intra_df = _candles_to_df(resp.data.candles)
     intra_df = intra_df.iloc[::-1].reset_index(drop=True)  # oldest first
     if not intra_df.empty:

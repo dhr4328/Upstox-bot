@@ -21,6 +21,8 @@ Monitor:
   - Evaluates the latest closed candle's close price for P&L.
   - TARGET_PNL = +₹600  →  close trade (TARGET)
   - SL_PNL     = -₹300  →  close trade (STOP LOSS)
+  - Multiple concurrent trades are supported; each signal spawns its own
+    independent monitor thread.
 
 Constants:
   LOT_SIZE   = 65     (NIFTY lot size)
@@ -114,11 +116,11 @@ _history_api      = upstox_client.HistoryV3Api(_api_client)
 _order_api = upstox_client.OrderApiV3(_api_client)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# One-trade-at-a-time guard
+# Active-trades registry  —  multiple concurrent trades supported
 # ══════════════════════════════════════════════════════════════════════════════
 
-_trade_lock   = threading.Lock()
-_active_trade = None   # None when no position is open
+_trades_lock   = threading.Lock()
+_active_trades: list = []   # list of currently open trade dicts
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Telegram
@@ -216,9 +218,6 @@ def get_expiry_date() -> str:
     Fetches the list of available expiry dates for NIFTY options directly
     from the Upstox get_option_contracts API and returns the nearest
     upcoming one as 'YYYY-MM-DD'.
-
-    This is exchange-driven — no hard-coded day-of-week logic, so it
-    remains correct regardless of future NSE expiry day changes.
     """
     try:
         resp = _options_api.get_option_contracts("NSE_INDEX|Nifty 50")
@@ -230,17 +229,13 @@ def get_expiry_date() -> str:
 
     today = _ist_now().date()
 
-    # Collect unique expiry dates that are >= today
     expiries = set()
     for contract in resp.data:
         raw = getattr(contract, "expiry", None) or getattr(contract, "expiry_date", None)
         if not raw:
             continue
-        # raw can be datetime.datetime, datetime.date, or a string like '2025-05-13'
-        # IMPORTANT: check datetime.datetime BEFORE datetime.date because
-        # datetime.datetime is a subclass of datetime.date — isinstance(dt, date) == True
         if isinstance(raw, datetime.datetime):
-            exp_date = raw.date()          # strip time component
+            exp_date = raw.date()
         elif isinstance(raw, datetime.date):
             exp_date = raw
         else:
@@ -272,18 +267,9 @@ def get_option_instrument_key(
 ) -> tuple[str, int, float, str]:
     """
     Finds the ATM option contract for the nearest available expiry.
-
-    Flow
-    ----
-    1. Call get_option_contracts → extract nearest expiry from exchange data.
-    2. Call get_put_call_option_chain with that expiry (official snippet).
-    3. Return the ATM or nearest strike instrument key + metadata.
-
-    Returns
-    -------
-    (instrument_key, strike, chain_ltp, expiry_date)
+    Returns (instrument_key, strike, chain_ltp, expiry_date).
     """
-    expiry_date = get_expiry_date()          # dynamically fetched from exchange
+    expiry_date = get_expiry_date()
     atm_strike  = round(nifty_ltp / NIFTY_STEP) * NIFTY_STEP
 
     print(
@@ -291,7 +277,6 @@ def get_option_instrument_key(
         f"Type={option_type}  Expiry={expiry_date}"
     )
 
-    # ── Official snippet pattern ───────────────────────────────────────────────
     configuration = upstox_client.Configuration()
     configuration.access_token = access_token
     api_instance = upstox_client.OptionsApi(upstox_client.ApiClient(configuration))
@@ -313,7 +298,6 @@ def get_option_instrument_key(
 
     print(f"[ORDER] Option chain fetched — {len(resp.data)} strikes available.")
 
-    # Build strike → {CE_key, CE_ltp, PE_key, PE_ltp}
     chain: dict[int, dict] = {}
     for row in resp.data:
         s = int(row.strike_price)
@@ -325,7 +309,6 @@ def get_option_instrument_key(
             e["PE_key"] = row.put_options.instrument_key
             e["PE_ltp"] = float(row.put_options.market_data.ltp or 0)
 
-    # Try ATM, then ±1 strike fallbacks
     for s in [atm_strike, atm_strike + NIFTY_STEP, atm_strike - NIFTY_STEP]:
         if s in chain and f"{option_type}_key" in chain[s]:
             return (
@@ -370,7 +353,7 @@ def _place_real_order(instrument_key: str, transaction_type: str = "BUY") -> str
     """
     order_body = upstox_client.PlaceOrderV3Request(
         quantity           = LOT_SIZE,
-        product            = "I",          # Intraday / MIS
+        product            = "I",
         validity           = "DAY",
         price              = 0.0,
         instrument_token   = instrument_key,
@@ -436,10 +419,10 @@ def _monitor_trade(trade: dict):
     Every OPTION_POLL_INTERVAL seconds:
       1. Fetch latest 1-min option candles.
       2. Detect target/SL hits using candle HIGH/LOW (not just close).
-      3. Square off and release the active-trade slot.
-    """
-    global _active_trade
+      3. Square off and remove this trade from the active-trades registry.
 
+    Multiple monitor threads can run concurrently (one per open trade).
+    """
     instr    = trade["instrument_key"]
     entry    = float(trade["entry_price"])
     opt_type = trade["option_type"]
@@ -457,7 +440,7 @@ def _monitor_trade(trade: dict):
     )
 
     last_candle_ts = None
-    trade_closed = False
+    trade_closed   = False
 
     try:
         while True:
@@ -469,7 +452,7 @@ def _monitor_trade(trade: dict):
                 continue
 
             latest = candles[-1]
-            ts = latest["datetime"]
+            ts     = latest["datetime"]
 
             if ts == last_candle_ts:
                 print(
@@ -479,43 +462,43 @@ def _monitor_trade(trade: dict):
                 continue
 
             last_candle_ts = ts
-            cur_open = float(latest["open"])
-            cur_high = float(latest["high"])
-            cur_low = float(latest["low"])
+            cur_open  = float(latest["open"])
+            cur_high  = float(latest["high"])
+            cur_low   = float(latest["low"])
             cur_close = float(latest["close"])
-            mark_pnl = (cur_close - entry) * LOT_SIZE
+            mark_pnl  = (cur_close - entry) * LOT_SIZE
 
             print(
-                f"[MONITOR] 1-min candle @ "
+                f"[MONITOR] ({opt_type}{strike}) 1-min candle @ "
                 f"{_format_ist_timestamp(ts, '%d-%b %H:%M:%S IST')}  "
                 f"O={cur_open:.2f}  H={cur_high:.2f}  L={cur_low:.2f}  C={cur_close:.2f}  "
                 f"-> Mark P&L = Rs.{mark_pnl:+.2f}"
             )
 
             hit_target = cur_high >= target_px
-            hit_sl = cur_low <= sl_px
+            hit_sl     = cur_low  <= sl_px
 
             exit_reason = None
-            exit_price = None
+            exit_price  = None
 
             if hit_target and hit_sl:
                 exit_reason = "SL"
-                exit_price = sl_px
+                exit_price  = sl_px
                 print(
                     "[MONITOR] Target and SL both touched in same candle; "
                     "using SL as conservative assumption."
                 )
             elif hit_target:
                 exit_reason = "TARGET"
-                exit_price = target_px
+                exit_price  = target_px
             elif hit_sl:
                 exit_reason = "SL"
-                exit_price = sl_px
+                exit_price  = sl_px
 
             if exit_reason is None:
                 continue
 
-            pnl = (exit_price - entry) * LOT_SIZE
+            pnl     = (exit_price - entry) * LOT_SIZE
             exit_ts = _format_ist_timestamp(ts)
 
             if VIRTUAL_MODE:
@@ -536,15 +519,15 @@ def _monitor_trade(trade: dict):
                     )
 
             _alert_trade_result(
-                signal=signal,
-                option_type=opt_type,
-                strike=strike,
-                entry_price=entry,
-                exit_price=exit_price,
-                pnl=pnl,
-                exit_reason=exit_reason,
-                exit_ts=exit_ts,
-                signal_time=sig_t,
+                signal      = signal,
+                option_type = opt_type,
+                strike      = strike,
+                entry_price = entry,
+                exit_price  = exit_price,
+                pnl         = pnl,
+                exit_reason = exit_reason,
+                exit_ts     = exit_ts,
+                signal_time = sig_t,
             )
             trade_closed = True
             break
@@ -557,20 +540,25 @@ def _monitor_trade(trade: dict):
             f"Error  : `{exc}`"
         )
     finally:
-        with _trade_lock:
-            _active_trade = None
+        with _trades_lock:
+            try:
+                _active_trades.remove(trade)
+            except ValueError:
+                pass
         if trade_closed:
-            print("[MONITOR] Trade closed - ready for next signal.\n")
+            print(f"[MONITOR] Trade closed ({opt_type} {strike}) — ready for next signal.\n")
         else:
-            print("[MONITOR] Monitor stopped - trade slot released for safety.\n")
+            print(f"[MONITOR] Monitor stopped ({opt_type} {strike}) — slot released for safety.\n")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Public entry point  (called by websocket.py on every fresh SBT signal)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
     """
     Called by websocket.py when the SBT strategy fires a new signal
-    on the latest closed 5-min NIFTY candle.
+    on the latest closed 1-min NIFTY candle.
 
     Parameters
     ----------
@@ -583,26 +571,20 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
     LONG  →  Virtual/Real BUY  CE (Call)  at ATM strike
     SHORT →  Virtual/Real BUY  PE (Put)   at ATM strike
 
-    Only one active trade at a time; new signals are skipped until
-    the running trade hits its TARGET or SL.
+    Multiple concurrent trades are allowed; every fresh signal spawns
+    its own independent monitor thread with no blocking guard.
     """
-    global _active_trade
     signal_time = _format_ist_timestamp(signal_time)
-
-    # ── Guard: skip if a trade is already running ──────────────────────────
-    with _trade_lock:
-        if _active_trade is not None:
-            print(
-                f"[ORDER] Signal '{signal}' ignored — trade already active: "
-                f"{_active_trade['option_type']} {_active_trade['strike']}"
-            )
-            return
 
     option_type = "CE" if signal == "LONG" else "PE"
     mode_tag    = "[VIRTUAL]" if VIRTUAL_MODE else "[LIVE]"
 
+    with _trades_lock:
+        active_count = len(_active_trades)
+
     print(f"\n{'='*62}")
     print(f"  {mode_tag}  NEW SIGNAL : {signal}  →  {option_type}  |  {signal_time}")
+    print(f"  Active trades currently running: {active_count}")
     print(f"{'='*62}")
 
     try:
@@ -623,14 +605,14 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
 
         # 3. Place order (virtual or real)
         if VIRTUAL_MODE:
-            order_id = f"VIRTUAL-{_ist_now().strftime('%H%M%S')}"
+            order_id = f"VIRTUAL-{_ist_now().strftime('%H%M%S%f')[:13]}"
             print(f"[ORDER] {mode_tag} BUY  NIFTY {strike} {option_type}  "
                   f"Qty={LOT_SIZE}  Price=₹{entry_price:.2f}  "
                   f"ref={order_id}")
         else:
             order_id = _place_real_order(instr_key, transaction_type="BUY")
 
-        # 4. Store trade record
+        # 4. Store trade record and register it in the active list
         trade = {
             "instrument_key": instr_key,
             "strike":         strike,
@@ -641,8 +623,8 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
             "signal":         signal,
             "signal_time":    signal_time,
         }
-        with _trade_lock:
-            _active_trade = trade
+        with _trades_lock:
+            _active_trades.append(trade)
 
         # 5. Alert 1 — Signal + entry details
         _alert_signal_entry(
@@ -660,7 +642,7 @@ def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
             target = _monitor_trade,
             args   = (trade,),
             daemon = True,
-            name   = f"monitor-{option_type}{strike}",
+            name   = f"monitor-{option_type}{strike}-{order_id[-6:]}",
         )
         t.start()
         print(f"[ORDER] Monitor thread '{t.name}' started.\n")

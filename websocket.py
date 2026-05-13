@@ -2,11 +2,11 @@
 websocket.py  —  Upstox Live WebSocket Feed (Nifty 50)
 
 Flow:
-  1. Load historical 5-min OHLC candles from buffer_data.py  (seed)
+  1. Load historical 1-min OHLC candles from buffer_data.py  (seed)
   2. Connect to Upstox WebSocket, subscribe to Nifty 50 LTP ticks
-  3. Continuously build live 5-min candles and APPEND them after the
+  3. Continuously build live 1-min candles and APPEND them after the
      historical data so the full dataset is always contiguous.
-  4. On every 5-min candle close, run Super Bollinger Trend strategy.
+  4. On every 1-min candle close, run Super Bollinger Trend strategy.
   5. If a fresh signal fires → place an option order via order_manager.
      The option P&L is then monitored on a 1-min candle feed.
 """
@@ -30,7 +30,7 @@ from config import access_token, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 AUTH_URL       = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
-CANDLE_MINUTES = 5   # NIFTY live candle timeframe (5 minutes)
+CANDLE_MINUTES = 1   # NIFTY live candle timeframe (1 minute)
 
 IST_TZ         = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
@@ -115,7 +115,7 @@ def load_historical_buffer():
     Build the seed candle list for the live feed:
 
     1. Multi-day historical candles from buffer_data.py  (past sessions)
-    2. Today's intraday 5-min candles from intraday_data.py
+    2. Today's intraday 1-min candles from intraday_data.py
        — fetched ONLY when the bot starts after 09:15 IST;
          returns [] automatically if started at/before 09:15.
 
@@ -168,14 +168,13 @@ def load_historical_buffer():
             seen.add(ts)
             unique.append(c)
 
-    # ── Drop the last candle if it belongs to the current open 5-min bucket ───
+    # ── Drop the last candle if it belongs to the current open 1-min bucket ───
     # The Upstox intraday API often returns the still-forming candle as its
     # last entry.  Using an incomplete candle as a "closed" seed produces wrong
     # OHLC values, which shifts the SBT line and causes missed / false signals.
     # We strip it here; the WebSocket live feed will build that candle properly.
-    now        = _ist_now_naive()
-    minute_mod = now.minute - (now.minute % 5)
-    open_bucket_ts = now.replace(minute=minute_mod, second=0, microsecond=0)
+    now            = _ist_now_naive()
+    open_bucket_ts = now.replace(second=0, microsecond=0)  # 1-min bucket: just zero out seconds
     if unique and unique[-1]["time"] >= open_bucket_ts:
         dropped = unique.pop()
         seed_open_candle = dropped.copy()
@@ -429,17 +428,16 @@ def decode_message(raw: bytes):
 
 def update_candle(ltp: float):
     """
-    Feed one LTP tick into the current 5-minute candle.
+    Feed one LTP tick into the current 1-minute candle.
     When the minute-bucket rolls over, close the current candle, append it to
     candles_5m (right after the historical data), and open a fresh one.
     """
     global open_candle
 
-    now        = _ist_now_naive()
-    minute_mod = now.minute - (now.minute % CANDLE_MINUTES)
-    candle_ts  = now.replace(minute=minute_mod, second=0, microsecond=0)
+    now       = _ist_now_naive()
+    candle_ts = now.replace(second=0, microsecond=0)  # 1-min bucket
 
-    # ── Guard: ignore ticks whose 5-min bucket is already in the buffer ──────
+    # ── Guard: ignore ticks whose 1-min bucket is already in the buffer ──────
     if candles_5m:
         last_buffered_ts = candles_5m[-1]["time"]
         if candle_ts <= last_buffered_ts:
@@ -480,7 +478,7 @@ def update_candle(ltp: float):
             "low": ltp, "close": ltp, "volume": 0, "source": "live",
         }
     else:
-        # Same 5-min bucket — update high / low / close
+        # Same 1-min bucket — update high / low / close
         open_candle["high"]  = max(open_candle["high"],  ltp)
         open_candle["low"]   = min(open_candle["low"],   ltp)
         open_candle["close"] = ltp
@@ -529,7 +527,7 @@ if __name__ == "__main__":
             f"{_format_ist_timestamp(open_candle['time'], '%d-%b %H:%M IST')}"
         )
     print("=" * 60)
-    print("  Upstox  |  Nifty 50  |  1-Minute OHLC  (Live + Historical)")
+    print("  Upstox  |  Nifty 50  |  1-Minute OHLC  (Live + Historical)  [1-min candles]")
     print("  Strategy : Super Bollinger Trend  (period=12, mult=2.0)")
     print("  Orders   : LONG→CE  SHORT→PE  | Target=+₹600  SL=-₹300")
     print("=" * 60)

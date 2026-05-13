@@ -1,5 +1,5 @@
 """
-intraday_data.py  —  Fetch today's missed 5-min candles when bot starts late.
+intraday_data.py  —  Fetch today's missed 1-min candles when bot starts late.
 
 Logic
 ─────
@@ -7,7 +7,7 @@ Logic
 • If the bot is started AT or BEFORE 09:15, this module returns an empty list
   — the WebSocket will build all candles from scratch.
 • If the bot is started AFTER 09:15 (e.g. 10:00 AM), this module fetches
-  all 5-min intraday candles from 09:15 up to the current time so the live
+  all 1-min intraday candles from 09:15 up to the current time so the live
   feed doesn't have to "catch up" from zero.
 
 Exposes
@@ -78,7 +78,7 @@ def _candles_to_df(candles) -> pd.DataFrame:
 
 def get_intraday_candles() -> list:
     """
-    Return today's 5-min intraday candles as a list of dicts
+    Return today's 1-min intraday candles as a list of dicts
     (sorted oldest → newest) **only** when the bot starts after 09:15 IST.
 
     Returns [] (empty list) if:
@@ -99,16 +99,16 @@ def get_intraday_candles() -> list:
 
     # ── Case: Bot started after market open — fetch missed candles ────────────
     minutes_elapsed = (now.hour * 60 + now.minute) - (9 * 60 + 15)
-    candles_expected = minutes_elapsed // 5
+    candles_expected = minutes_elapsed  # 1 candle per minute
     print(
         f"[INTRADAY] Bot started at {now_t.strftime('%H:%M')} — market has been open "
-        f"~{minutes_elapsed} min  ({candles_expected} expected 5-min candles). Fetching …"
+        f"~{minutes_elapsed} min  ({candles_expected} expected 1-min candles). Fetching …"
     )
 
     try:
         resp = _intraday_api.get_intra_day_candle_data(
             INSTRUMENT_KEY,
-            "5minute",   # interval string accepted by Upstox HistoryV3Api
+            "1minute",   # interval string accepted by Upstox HistoryV3Api
         )
         raw_df = _candles_to_df(resp.data.candles)
 
