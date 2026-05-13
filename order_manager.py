@@ -1,78 +1,65 @@
-"""
-order_manager.py  —  Virtual Option Order Manager for Live SBT Bot
+﻿"""
+order_manager.py - Option trade manager with live option websocket monitoring.
 
-VIRTUAL MODE: No real orders are placed via the broker API.
-  - Entry price is taken from the live option LTP at signal time.
-  - P&L is tracked using 1-minute intraday candles of the option.
-  - To switch to LIVE trading, set VIRTUAL_MODE = False.
-
-Signal → Option mapping:
-  LONG  (BUY signal)  →  CALL option (CE)  →  Virtual BUY CE
-  SHORT (SELL signal) →  PUT  option (PE)  →  Virtual BUY PE
-
-Telegram Alerts:
-  Alert 1  —  When a signal is generated and option is selected:
-               Shows signal type, option instrument, entry price, lot size.
-  Alert 2  —  When the trade is closed (target or SL hit):
-               Shows option, entry, exit, P&L, result (PROFIT / LOSS).
-
-Monitor:
-  - Fetches 1-minute intraday candles for the option every 62 seconds.
-  - Evaluates the latest closed candle's close price for P&L.
-  - TARGET_PNL = +₹600  →  close trade (TARGET)
-  - SL_PNL     = -₹300  →  close trade (STOP LOSS)
-  - Multiple concurrent trades are supported; each signal spawns its own
-    independent monitor thread.
-
-Constants:
-  LOT_SIZE   = 65     (NIFTY lot size)
-  TARGET_PNL = 600    (₹ profit target per trade)
-  SL_PNL     = -300   (₹ stop-loss per trade)
-  NIFTY_STEP = 50     (NIFTY strike step in index points)
+When a signal is generated:
+1. Resolve ATM option contract (CE for LONG, PE for SHORT).
+2. Open virtual/live buy trade.
+3. Start a dedicated websocket for that option instrument.
+4. Track tick-by-tick P&L and close on target/SL.
+5. Send entry and exit trade reports to Telegram.
 """
 
-import os
+import asyncio
 import datetime
+import json
+import os
+import ssl
 import threading
 import time
 
 import requests
 import upstox_client
+import websockets
 from upstox_client.rest import ApiException
 
-from config import access_token, data_token, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODE SWITCH  —  controlled by VIRTUAL_MODE environment variable
-#   GitHub Actions: set via workflow_dispatch input (default: "true")
-#   Local dev     : export VIRTUAL_MODE=true   (or false for live)
-# ══════════════════════════════════════════════════════════════════════════════
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, access_token
 
 VIRTUAL_MODE = os.environ.get("VIRTUAL_MODE", "true").lower() != "false"
 
-print(
-    f"[ORDER_MGR] Mode = {'🔵 VIRTUAL (paper trade)' if VIRTUAL_MODE else '🟢 LIVE (real orders)'}"
-)
+LOT_SIZE = 65
+TARGET_PNL = 600.0
+SL_PNL = -300.0
+NIFTY_STEP = 50
+OPTION_LOG_INTERVAL_SEC = 5.0
+DAILY_SUMMARY_TIME = datetime.time(15, 31)  # 3:31 PM IST
+SUMMARY_CHECK_INTERVAL_SEC = 30
+IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+AUTH_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Constants
-# ══════════════════════════════════════════════════════════════════════════════
+print(f"[ORDER_MGR] Mode = {'VIRTUAL' if VIRTUAL_MODE else 'LIVE'}")
 
-LOT_SIZE             = 65      # NIFTY lot size (shares per lot)
-TARGET_PNL           = 600     # ₹ profit target per trade
-SL_PNL               = -300    # ₹ stop-loss per trade (negative)
-NIFTY_STEP           = 50      # NIFTY strike step in index points
-OPTION_POLL_INTERVAL = 62      # seconds between 1-min candle polls
-IST_TZ               = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+_cfg = upstox_client.Configuration()
+_cfg.access_token = access_token
+_api_client = upstox_client.ApiClient(_cfg)
+
+_options_api = upstox_client.OptionsApi(_api_client)
+_market_quote_api = upstox_client.MarketQuoteApi(_api_client)
+_order_api = upstox_client.OrderApiV3(_api_client)
+
+_trades_lock = threading.Lock()
+_active_trades: list[dict] = []
+
+_summary_lock = threading.Lock()
+_closed_trades_by_day: dict[datetime.date, list[dict]] = {}
+_summary_sent_days: set[datetime.date] = set()
+_summary_worker_started = False
 
 
 def _ist_now() -> datetime.datetime:
-    """Current timezone-aware IST datetime."""
     return datetime.datetime.now(IST_TZ)
 
 
 def _to_ist_naive_datetime(value):
-    """Normalize datetime-like values to naive IST datetime for formatting."""
     if value is None:
         return None
 
@@ -100,558 +87,525 @@ def _format_ist_timestamp(value, fmt: str = "%d-%b-%Y %H:%M:%S IST") -> str:
         return str(value)
     return dt.strftime(fmt)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Upstox SDK client  —  single access_token (official snippet pattern)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_cfg              = upstox_client.Configuration()
-_cfg.access_token = access_token          # single token for all APIs
-_api_client       = upstox_client.ApiClient(_cfg)
-
-_options_api      = upstox_client.OptionsApi(_api_client)
-_market_quote_api = upstox_client.MarketQuoteApi(_api_client)
-_history_api      = upstox_client.HistoryV3Api(_api_client)
-
-# Only instantiated when VIRTUAL_MODE is False
-_order_api = upstox_client.OrderApiV3(_api_client)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Active-trades registry  —  multiple concurrent trades supported
-# ══════════════════════════════════════════════════════════════════════════════
-
-_trades_lock   = threading.Lock()
-_active_trades: list = []   # list of currently open trade dicts
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Telegram
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _send_telegram(text: str):
-    """Post a message to the configured Telegram chat (best-effort)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TELEGRAM] Credentials not configured — skipping.")
+        print("[TELEGRAM] Missing credentials; skipping message.")
         return
-    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+
     try:
-        r = requests.post(url, data=data, timeout=10)
-        if r.status_code == 200:
-            print("[TELEGRAM] ✓ Alert sent.")
-        else:
-            print(f"[TELEGRAM] HTTP {r.status_code}: {r.text[:200]}")
+        resp = requests.post(url, data=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"[TELEGRAM] Failed ({resp.status_code}): {resp.text[:200]}")
     except Exception as exc:
         print(f"[TELEGRAM] Error: {exc}")
 
 
-def _alert_signal_entry(signal: str, option_type: str, strike: int,
-                        instr_key: str, entry_price: float,
-                        expiry: str, signal_time: str):
-    """
-    Telegram Alert 1 — Signal generated + option instrument selected.
-    """
-    arrow  = "📈" if signal == "LONG" else "📉"
-    mode   = "🔵 VIRTUAL" if VIRTUAL_MODE else "🟢 LIVE"
-    target = entry_price + (TARGET_PNL / LOT_SIZE)
-    sl_px  = entry_price + (SL_PNL    / LOT_SIZE)
+def _send_trade_entry_alert(trade: dict):
+    target_price = trade["entry_price"] + (TARGET_PNL / LOT_SIZE)
+    sl_price = trade["entry_price"] + (SL_PNL / LOT_SIZE)
 
-    signal_time_ist = _format_ist_timestamp(signal_time)
-
-    text = (
-        f"{arrow} *SBT Signal — Option Selected* {mode}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Signal      : *{signal}*\n"
-        f"🎯 Option      : *NIFTY {strike} {option_type}*\n"
-        f"📅 Expiry      : `{expiry}`\n"
-        f"🔑 Instrument  : `{instr_key}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry Price : `₹{entry_price:.2f}`\n"
-        f"📦 Lot Size    : `{LOT_SIZE} shares (1 lot)`\n"
-        f"🎯 Target      : `₹{target:.2f}` (+₹{TARGET_PNL})\n"
-        f"🛑 Stop Loss   : `₹{sl_px:.2f}` (₹{SL_PNL})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ Signal Time : `{signal_time_ist}`"
+    message = (
+        "Signal Triggered - Option Trade Started\n"
+        f"Mode: {'VIRTUAL' if VIRTUAL_MODE else 'LIVE'}\n"
+        f"Signal: {trade['signal']}\n"
+        f"Instrument: NIFTY {trade['strike']} {trade['option_type']}\n"
+        f"Expiry: {trade['expiry_date']}\n"
+        f"Instrument Key: {trade['instrument_key']}\n"
+        f"Entry: Rs {trade['entry_price']:.2f}\n"
+        f"Lot Size: {LOT_SIZE}\n"
+        f"Target Price: Rs {target_price:.2f} (P&L +Rs {TARGET_PNL:.2f})\n"
+        f"Stop Price: Rs {sl_price:.2f} (P&L Rs {SL_PNL:.2f})\n"
+        f"Signal Time: {trade['signal_time']}"
     )
-    print(f"\n[TELEGRAM] Sending Alert 1 — Signal Entry")
-    _send_telegram(text)
+    _send_telegram(message)
 
 
-def _alert_trade_result(signal: str, option_type: str, strike: int,
-                        entry_price: float, exit_price: float,
-                        pnl: float, exit_reason: str,
-                        exit_ts: str, signal_time: str):
-    """
-    Telegram Alert 2 — Trade closed with result.
-    """
-    is_profit  = pnl >= 0
-    result_tag = "✅ PROFIT" if is_profit else "❌ LOSS"
-    emoji      = "🎯" if exit_reason == "TARGET" else "🛑"
-    mode       = "🔵 VIRTUAL" if VIRTUAL_MODE else "🟢 LIVE"
+def _send_trade_exit_alert(trade: dict, exit_reason: str, exit_price: float, pnl: float, exit_time):
+    result = "PROFIT" if pnl >= 0 else "LOSS"
+    duration = _format_trade_duration(trade["entry_ts"], exit_time)
 
-    signal_time_ist = _format_ist_timestamp(signal_time)
-    exit_ts_ist = _format_ist_timestamp(exit_ts)
-
-    text = (
-        f"{emoji} *Trade Closed — {exit_reason} HIT* {mode}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Signal      : *{signal}*\n"
-        f"🎯 Option      : *NIFTY {strike} {option_type}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry Price : `₹{entry_price:.2f}`\n"
-        f"💸 Exit Price  : `₹{exit_price:.2f}`\n"
-        f"📈 P&L / share : `₹{exit_price - entry_price:+.2f}`\n"
-        f"💼 Net P&L     : *₹{pnl:+.2f}*  ({LOT_SIZE} shares)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Result      : *{result_tag}*\n"
-        f"⏰ Exit Time   : `{exit_ts_ist}`\n"
-        f"⏰ Signal Time : `{signal_time_ist}`"
+    message = (
+        "Trade Closed - Report\n"
+        f"Mode: {'VIRTUAL' if VIRTUAL_MODE else 'LIVE'}\n"
+        f"Signal: {trade['signal']}\n"
+        f"Instrument: NIFTY {trade['strike']} {trade['option_type']}\n"
+        f"Entry: Rs {trade['entry_price']:.2f}\n"
+        f"Exit: Rs {exit_price:.2f}\n"
+        f"Exit Reason: {exit_reason}\n"
+        f"P&L: Rs {pnl:+.2f}\n"
+        f"Result: {result}\n"
+        f"Signal Time: {trade['signal_time']}\n"
+        f"Entry Time: {_format_ist_timestamp(trade['entry_ts'])}\n"
+        f"Exit Time: {_format_ist_timestamp(exit_time)}\n"
+        f"Duration: {duration}"
     )
-    print(f"\n[TELEGRAM] Sending Alert 2 — Trade Result  ({result_tag})")
-    _send_telegram(text)
+    _send_telegram(message)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Expiry date — fetched dynamically from Upstox get_option_contracts
-# ══════════════════════════════════════════════════════════════════════════════
+def _format_trade_duration(start_ts: datetime.datetime, end_ts: datetime.datetime) -> str:
+    delta = end_ts - start_ts
+    total_sec = int(max(delta.total_seconds(), 0))
+    minutes, seconds = divmod(total_sec, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _record_closed_trade(trade: dict, exit_reason: str, exit_price: float, pnl: float, exit_time: datetime.datetime):
+    trade_day = trade["entry_ts"].date()
+    row = {
+        "signal": trade["signal"],
+        "strike": trade["strike"],
+        "option_type": trade["option_type"],
+        "entry_price": float(trade["entry_price"]),
+        "exit_price": float(exit_price),
+        "exit_reason": exit_reason,
+        "pnl": float(pnl),
+        "entry_ts": trade["entry_ts"],
+        "exit_ts": exit_time,
+    }
+    with _summary_lock:
+        _closed_trades_by_day.setdefault(trade_day, []).append(row)
+
+
+def _has_open_trades_for_day(trade_day: datetime.date) -> bool:
+    with _trades_lock:
+        for trade in _active_trades:
+            if trade["entry_ts"].date() == trade_day:
+                return True
+    return False
+
+
+def _try_send_daily_summary_for_day(trade_day: datetime.date, force: bool = False) -> bool:
+    now = _ist_now().replace(tzinfo=None)
+    summary_time = datetime.datetime.combine(trade_day, DAILY_SUMMARY_TIME)
+    if not force and now < summary_time:
+        return False
+
+    if not force and _has_open_trades_for_day(trade_day):
+        return False
+
+    with _summary_lock:
+        if trade_day in _summary_sent_days:
+            return False
+        trades = list(_closed_trades_by_day.get(trade_day, []))
+
+    if not trades:
+        return False
+
+    total = len(trades)
+    wins = sum(1 for item in trades if item["pnl"] >= 0)
+    losses = total - wins
+    net_pnl = sum(item["pnl"] for item in trades)
+    gross_profit = sum(item["pnl"] for item in trades if item["pnl"] > 0)
+    gross_loss = sum(item["pnl"] for item in trades if item["pnl"] < 0)
+    best_trade = max(item["pnl"] for item in trades)
+    worst_trade = min(item["pnl"] for item in trades)
+    avg_pnl = net_pnl / total if total else 0.0
+    win_rate = (wins * 100.0 / total) if total else 0.0
+
+    mode = "VIRTUAL" if VIRTUAL_MODE else "LIVE"
+    message = (
+        "Daily Trade Summary\n"
+        f"Date: {trade_day.isoformat()} (IST)\n"
+        f"Mode: {mode}\n"
+        f"Total Trades: {total}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Win Rate: {win_rate:.2f}%\n"
+        f"Net P&L: Rs {net_pnl:+.2f}\n"
+        f"Gross Profit: Rs {gross_profit:+.2f}\n"
+        f"Gross Loss: Rs {gross_loss:+.2f}\n"
+        f"Avg P&L/Trade: Rs {avg_pnl:+.2f}\n"
+        f"Best Trade: Rs {best_trade:+.2f}\n"
+        f"Worst Trade: Rs {worst_trade:+.2f}"
+    )
+    _send_telegram(message)
+
+    with _summary_lock:
+        _summary_sent_days.add(trade_day)
+    print(f"[SUMMARY] Daily summary sent for {trade_day} ({total} trades).")
+    return True
+
+
+def _daily_summary_worker():
+    while True:
+        try:
+            now = _ist_now().replace(tzinfo=None)
+            today = now.date()
+            _try_send_daily_summary_for_day(today)
+        except Exception as exc:
+            print(f"[SUMMARY] Worker error: {exc}")
+        time.sleep(SUMMARY_CHECK_INTERVAL_SEC)
+
+
+def _ensure_daily_summary_worker_started():
+    global _summary_worker_started
+    with _summary_lock:
+        if _summary_worker_started:
+            return
+        _summary_worker_started = True
+
+    worker = threading.Thread(
+        target=_daily_summary_worker,
+        daemon=True,
+        name="daily-summary-worker",
+    )
+    worker.start()
+    print("[SUMMARY] Daily summary worker started.")
+
+
+def _get_ws_url() -> str:
+    if not access_token:
+        raise RuntimeError("UPSTOX_ACCESS_TOKEN is missing.")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    response = requests.get(AUTH_URL, headers=headers, allow_redirects=False, timeout=10)
+
+    if response.status_code in (301, 302, 307, 308):
+        redirect = response.headers.get("Location", "")
+        if redirect:
+            return redirect
+
+    payload = response.json()
+    ws_url = (
+        payload.get("data", {}).get("authorizedRedirectUri")
+        or payload.get("data", {}).get("uri")
+        or payload.get("data", {}).get("authenticated_redirect_uri")
+        or ""
+    )
+    if ws_url:
+        return ws_url
+
+    raise RuntimeError(f"Unable to authorize websocket URL: HTTP {response.status_code}")
+
+
+def _subscribe_message(instrument_keys: list[str]) -> bytes:
+    payload = {
+        "guid": f"opt-{int(time.time())}",
+        "method": "sub",
+        "data": {"mode": "ltpc", "instrumentKeys": instrument_keys},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def _decode_ltp(raw: bytes, instrument_key: str):
+    try:
+        from upstox_client.feeder.proto import MarketDataFeedV3_pb2
+
+        feed = MarketDataFeedV3_pb2.FeedResponse()
+        feed.ParseFromString(raw)
+        tick = feed.feeds.get(instrument_key)
+        if tick and tick.HasField("ltpc"):
+            return float(tick.ltpc.ltp)
+    except Exception as exc:
+        print(f"[OPTION_WS] Decode error: {exc}")
+    return None
+
 
 def get_expiry_date() -> str:
-    """
-    Fetches the list of available expiry dates for NIFTY options directly
-    from the Upstox get_option_contracts API and returns the nearest
-    upcoming one as 'YYYY-MM-DD'.
-    """
     try:
-        resp = _options_api.get_option_contracts("NSE_INDEX|Nifty 50")
+        response = _options_api.get_option_contracts("NSE_INDEX|Nifty 50")
     except ApiException as exc:
-        raise RuntimeError(f"get_option_contracts API error: {exc}") from exc
+        raise RuntimeError(f"get_option_contracts failed: {exc}") from exc
 
-    if not resp or not resp.data:
-        raise RuntimeError("get_option_contracts returned no data — check access_token scope.")
+    if not response or not response.data:
+        raise RuntimeError("No option contracts returned by Upstox.")
 
     today = _ist_now().date()
-
     expiries = set()
-    for contract in resp.data:
-        raw = getattr(contract, "expiry", None) or getattr(contract, "expiry_date", None)
-        if not raw:
+
+    for contract in response.data:
+        raw_expiry = getattr(contract, "expiry", None) or getattr(contract, "expiry_date", None)
+        if not raw_expiry:
             continue
-        if isinstance(raw, datetime.datetime):
-            exp_date = raw.date()
-        elif isinstance(raw, datetime.date):
-            exp_date = raw
+
+        if isinstance(raw_expiry, datetime.datetime):
+            expiry_date = raw_expiry.date()
+        elif isinstance(raw_expiry, datetime.date):
+            expiry_date = raw_expiry
         else:
             try:
-                exp_date = datetime.datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                expiry_date = datetime.datetime.strptime(str(raw_expiry)[:10], "%Y-%m-%d").date()
             except ValueError:
                 continue
-        if exp_date >= today:
-            expiries.add(exp_date)
+
+        if expiry_date >= today:
+            expiries.add(expiry_date)
 
     if not expiries:
-        raise RuntimeError(
-            f"No upcoming expiry dates found in get_option_contracts response "
-            f"(today={today}). Check your access_token."
-        )
+        raise RuntimeError("No upcoming expiry date found.")
 
     nearest = min(expiries)
-    print(f"[ORDER] Available expiries (nearest 5): {sorted(expiries)[:5]}")
-    print(f"[ORDER] Selected expiry: {nearest}")
     return nearest.strftime("%Y-%m-%d")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Option chain — resolve instrument key  (official snippet pattern)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_option_instrument_key(
-    nifty_ltp: float, option_type: str
-) -> tuple[str, int, float, str]:
-    """
-    Finds the ATM option contract for the nearest available expiry.
-    Returns (instrument_key, strike, chain_ltp, expiry_date).
-    """
+def get_option_instrument_key(nifty_ltp: float, option_type: str) -> tuple[str, int, float, str]:
     expiry_date = get_expiry_date()
-    atm_strike  = round(nifty_ltp / NIFTY_STEP) * NIFTY_STEP
-
-    print(
-        f"[ORDER] NIFTY LTP={nifty_ltp:.2f}  ATM={atm_strike}  "
-        f"Type={option_type}  Expiry={expiry_date}"
-    )
-
-    configuration = upstox_client.Configuration()
-    configuration.access_token = access_token
-    api_instance = upstox_client.OptionsApi(upstox_client.ApiClient(configuration))
+    atm_strike = round(nifty_ltp / NIFTY_STEP) * NIFTY_STEP
 
     try:
-        resp = api_instance.get_put_call_option_chain(
-            "NSE_INDEX|Nifty 50",
-            expiry_date,
-        )
+        response = _options_api.get_put_call_option_chain("NSE_INDEX|Nifty 50", expiry_date)
     except ApiException as exc:
         raise RuntimeError(f"Option chain API error: {exc}") from exc
 
-    if not resp or not resp.data:
-        raise RuntimeError(
-            f"Option chain response is empty for expiry={expiry_date}. "
-            f"Verify the expiry date is valid and the access_token has "
-            f"Options data scope."
-        )
-
-    print(f"[ORDER] Option chain fetched — {len(resp.data)} strikes available.")
+    if not response or not response.data:
+        raise RuntimeError(f"Option chain is empty for expiry {expiry_date}.")
 
     chain: dict[int, dict] = {}
-    for row in resp.data:
-        s = int(row.strike_price)
-        e = chain.setdefault(s, {})
+    for row in response.data:
+        strike = int(row.strike_price)
+        data = chain.setdefault(strike, {})
+
         if row.call_options and row.call_options.market_data:
-            e["CE_key"] = row.call_options.instrument_key
-            e["CE_ltp"] = float(row.call_options.market_data.ltp or 0)
+            data["CE_key"] = row.call_options.instrument_key
+            data["CE_ltp"] = float(row.call_options.market_data.ltp or 0.0)
+
         if row.put_options and row.put_options.market_data:
-            e["PE_key"] = row.put_options.instrument_key
-            e["PE_ltp"] = float(row.put_options.market_data.ltp or 0)
+            data["PE_key"] = row.put_options.instrument_key
+            data["PE_ltp"] = float(row.put_options.market_data.ltp or 0.0)
 
-    for s in [atm_strike, atm_strike + NIFTY_STEP, atm_strike - NIFTY_STEP]:
-        if s in chain and f"{option_type}_key" in chain[s]:
-            return (
-                chain[s][f"{option_type}_key"],
-                s,
-                chain[s].get(f"{option_type}_ltp", 0.0),
-                expiry_date,
-            )
+    preferred_strikes = [atm_strike, atm_strike + NIFTY_STEP, atm_strike - NIFTY_STEP]
+    for strike in preferred_strikes:
+        key_name = f"{option_type}_key"
+        ltp_name = f"{option_type}_ltp"
+        if strike in chain and key_name in chain[strike]:
+            return chain[strike][key_name], strike, chain[strike].get(ltp_name, 0.0), expiry_date
 
-    raise RuntimeError(
-        f"No {option_type} found near strike {atm_strike} "
-        f"for expiry {expiry_date}. "
-        f"Available strikes: {sorted(chain)[:10]}"
-    )
+    sorted_strikes = sorted(chain.keys(), key=lambda strike: abs(strike - atm_strike))
+    key_name = f"{option_type}_key"
+    ltp_name = f"{option_type}_ltp"
+    for strike in sorted_strikes:
+        if key_name in chain[strike]:
+            return chain[strike][key_name], strike, chain[strike].get(ltp_name, 0.0), expiry_date
 
+    raise RuntimeError(f"No {option_type} contract found near ATM {atm_strike}.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Live LTP for entry price reference
-# ══════════════════════════════════════════════════════════════════════════════
 
 def get_option_ltp(instrument_key: str) -> float:
-    """Fetch live LTP of an option via Market Quote API."""
     try:
-        resp = _market_quote_api.ltp(instrument_key)
-        if resp and resp.data:
-            val = next(iter(resp.data.values()))
-            return float(val.last_price)
+        response = _market_quote_api.ltp(instrument_key)
+        if response and response.data:
+            row = next(iter(response.data.values()))
+            return float(row.last_price)
     except Exception as exc:
-        print(f"[ORDER] LTP fetch error: {exc}")
+        print(f"[ORDER] LTP fetch failed: {exc}")
     return 0.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Broker order placement  (REAL — only called when VIRTUAL_MODE = False)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _place_real_order(instrument_key: str, transaction_type: str = "BUY") -> str:
-    """
-    Place a MARKET intraday order via Upstox OrderApiV3.
-    Only called when VIRTUAL_MODE = False.
-    Returns order_id string.
-    """
-    order_body = upstox_client.PlaceOrderV3Request(
-        quantity           = LOT_SIZE,
-        product            = "I",
-        validity           = "DAY",
-        price              = 0.0,
-        instrument_token   = instrument_key,
-        order_type         = "MARKET",
-        transaction_type   = transaction_type,
-        disclosed_quantity = 0,
-        trigger_price      = 0.0,
-        is_amo             = False,
-        slice              = False,
+def _place_real_order(instrument_key: str, transaction_type: str) -> str:
+    body = upstox_client.PlaceOrderV3Request(
+        quantity=LOT_SIZE,
+        product="I",
+        validity="DAY",
+        price=0.0,
+        instrument_token=instrument_key,
+        order_type="MARKET",
+        transaction_type=transaction_type,
+        disclosed_quantity=0,
+        trigger_price=0.0,
+        is_amo=False,
+        slice=False,
     )
+
     try:
-        resp     = _order_api.place_order(body=order_body)
-        order_id = resp.data.order_id
-        print(f"[ORDER] REAL {transaction_type} placed → order_id={order_id}")
-        return order_id
+        response = _order_api.place_order(body=body)
+        return response.data.order_id
     except ApiException as exc:
-        raise RuntimeError(f"place_order() failed: {exc}") from exc
+        raise RuntimeError(f"place_order failed: {exc}") from exc
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1-min option candle fetcher
-# ══════════════════════════════════════════════════════════════════════════════
+async def _monitor_trade_via_option_ws(trade: dict) -> tuple[str, float, float, datetime.datetime]:
+    instrument_key = trade["instrument_key"]
+    entry_price = float(trade["entry_price"])
 
-def _get_option_1min_candles(instrument_key: str) -> list[dict]:
-    """
-    Fetch today's 1-minute intraday candles for the option instrument.
-    Returns a list of dicts sorted oldest → newest.
-    Keys: datetime, open, high, low, close, volume.
-    Returns [] on any error.
-    """
-    try:
-        import pandas as pd
-        resp    = _history_api.get_intra_day_candle_data(instrument_key, "1minute")
-        candles = resp.data.candles if (resp and resp.data) else []
-        if not candles:
-            return []
-
-        df = pd.DataFrame(
-            candles,
-            columns=["datetime", "open", "high", "low", "close", "volume", "OI"],
-        )
-        df["datetime"] = (
-            pd.to_datetime(df["datetime"], utc=True)
-            .dt.tz_convert("Asia/Kolkata")
-            .dt.tz_localize(None)
-        )
-        df = df.sort_values("datetime").reset_index(drop=True)
-        return df.to_dict("records")
-
-    except Exception as exc:
-        print(f"[MONITOR] 1-min candle fetch error: {exc}")
-        return []
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Background monitor — checks 1-min option candles for TP / SL
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _monitor_trade(trade: dict):
-    """
-    Runs in a background daemon thread.
-
-    Every OPTION_POLL_INTERVAL seconds:
-      1. Fetch latest 1-min option candles.
-      2. Detect target/SL hits using candle HIGH/LOW (not just close).
-      3. Square off and remove this trade from the active-trades registry.
-
-    Multiple monitor threads can run concurrently (one per open trade).
-    """
-    instr    = trade["instrument_key"]
-    entry    = float(trade["entry_price"])
-    opt_type = trade["option_type"]
-    strike   = trade["strike"]
-    sig_t    = trade["signal_time"]
-    signal   = trade["signal"]
-
-    target_px = entry + (TARGET_PNL / LOT_SIZE)
-    sl_px     = entry + (SL_PNL / LOT_SIZE)
+    target_price = entry_price + (TARGET_PNL / LOT_SIZE)
+    sl_price = entry_price + (SL_PNL / LOT_SIZE)
 
     print(
-        f"[MONITOR] Started - {opt_type} {strike}  "
-        f"Entry=Rs.{entry:.2f}  Target=Rs.{target_px:.2f}  SL=Rs.{sl_px:.2f}\n"
-        f"[MONITOR] Polling 1-min option candles every {OPTION_POLL_INTERVAL}s ..."
+        f"[OPTION_WS] Monitor started for {trade['option_type']}{trade['strike']} "
+        f"Entry={entry_price:.2f} Target={target_price:.2f} SL={sl_price:.2f}"
     )
 
-    last_candle_ts = None
-    trade_closed   = False
+    last_log_time = 0.0
+
+    while True:
+        ws_url = _get_ws_url()
+
+        try:
+            async with websockets.connect(ws_url, ssl=ssl.create_default_context(), ping_interval=20) as ws:
+                await ws.send(_subscribe_message([instrument_key]))
+                print(f"[OPTION_WS] Subscribed to {instrument_key}")
+
+                async for message in ws:
+                    if not isinstance(message, bytes):
+                        continue
+
+                    ltp = _decode_ltp(message, instrument_key)
+                    if ltp is None:
+                        continue
+
+                    exit_time = _ist_now().replace(tzinfo=None)
+                    pnl = (ltp - entry_price) * LOT_SIZE
+
+                    now_epoch = time.time()
+                    if now_epoch - last_log_time >= OPTION_LOG_INTERVAL_SEC:
+                        print(
+                            f"[OPTION_WS] {trade['option_type']}{trade['strike']} "
+                            f"LTP={ltp:.2f} P&L=Rs {pnl:+.2f}"
+                        )
+                        last_log_time = now_epoch
+
+                    if ltp >= target_price:
+                        return "TARGET", ltp, pnl, exit_time
+
+                    if ltp <= sl_price:
+                        return "SL", ltp, pnl, exit_time
+
+        except Exception as exc:
+            print(f"[OPTION_WS] Error for {instrument_key}: {exc}. Reconnecting in 2s...")
+            await asyncio.sleep(2)
+
+
+def _monitor_trade_worker(trade: dict):
+    trade_closed = False
+    trade_day = trade["entry_ts"].date()
 
     try:
-        while True:
-            time.sleep(OPTION_POLL_INTERVAL)
+        exit_reason, exit_price, pnl, exit_time = asyncio.run(_monitor_trade_via_option_ws(trade))
 
-            candles = _get_option_1min_candles(instr)
-            if not candles:
-                print("[MONITOR] No candle data yet - will retry next interval.")
-                continue
-
-            latest = candles[-1]
-            ts     = latest["datetime"]
-
-            if ts == last_candle_ts:
-                print(
-                    f"[MONITOR] No new candle since "
-                    f"{_format_ist_timestamp(ts, '%d-%b %H:%M:%S IST')} - waiting ..."
-                )
-                continue
-
-            last_candle_ts = ts
-            cur_open  = float(latest["open"])
-            cur_high  = float(latest["high"])
-            cur_low   = float(latest["low"])
-            cur_close = float(latest["close"])
-            mark_pnl  = (cur_close - entry) * LOT_SIZE
-
+        if VIRTUAL_MODE:
             print(
-                f"[MONITOR] ({opt_type}{strike}) 1-min candle @ "
-                f"{_format_ist_timestamp(ts, '%d-%b %H:%M:%S IST')}  "
-                f"O={cur_open:.2f}  H={cur_high:.2f}  L={cur_low:.2f}  C={cur_close:.2f}  "
-                f"-> Mark P&L = Rs.{mark_pnl:+.2f}"
+                f"[ORDER] VIRTUAL exit {trade['option_type']}{trade['strike']} "
+                f"Reason={exit_reason} Exit={exit_price:.2f} P&L=Rs {pnl:+.2f}"
             )
+        else:
+            sell_order_id = _place_real_order(trade["instrument_key"], transaction_type="SELL")
+            print(f"[ORDER] LIVE square-off order placed: {sell_order_id}")
 
-            hit_target = cur_high >= target_px
-            hit_sl     = cur_low  <= sl_px
-
-            exit_reason = None
-            exit_price  = None
-
-            if hit_target and hit_sl:
-                exit_reason = "SL"
-                exit_price  = sl_px
-                print(
-                    "[MONITOR] Target and SL both touched in same candle; "
-                    "using SL as conservative assumption."
-                )
-            elif hit_target:
-                exit_reason = "TARGET"
-                exit_price  = target_px
-            elif hit_sl:
-                exit_reason = "SL"
-                exit_price  = sl_px
-
-            if exit_reason is None:
-                continue
-
-            pnl     = (exit_price - entry) * LOT_SIZE
-            exit_ts = _format_ist_timestamp(ts)
-
-            if VIRTUAL_MODE:
-                print(
-                    f"[MONITOR] [{exit_reason}] VIRTUAL square-off  "
-                    f"Exit={exit_price:.2f}  P&L=Rs.{pnl:+.2f}"
-                )
-            else:
-                try:
-                    sq_id = _place_real_order(instr, transaction_type="SELL")
-                    print(f"[MONITOR] REAL square-off order_id={sq_id}")
-                except Exception as exc:
-                    print(f"[MONITOR] Square-off FAILED: {exc}")
-                    _send_telegram(
-                        f"Square-off FAILED\n"
-                        f"Option : `{opt_type} {strike}`\n"
-                        f"Error  : `{exc}`"
-                    )
-
-            _alert_trade_result(
-                signal      = signal,
-                option_type = opt_type,
-                strike      = strike,
-                entry_price = entry,
-                exit_price  = exit_price,
-                pnl         = pnl,
-                exit_reason = exit_reason,
-                exit_ts     = exit_ts,
-                signal_time = sig_t,
-            )
-            trade_closed = True
-            break
+        _send_trade_exit_alert(
+            trade=trade,
+            exit_reason=exit_reason,
+            exit_price=exit_price,
+            pnl=pnl,
+            exit_time=exit_time,
+        )
+        _record_closed_trade(
+            trade=trade,
+            exit_reason=exit_reason,
+            exit_price=exit_price,
+            pnl=pnl,
+            exit_time=exit_time,
+        )
+        trade_closed = True
 
     except Exception as exc:
-        print(f"[MONITOR] Monitor crashed: {exc}")
+        print(f"[ORDER] Monitor crashed for {trade['instrument_key']}: {exc}")
         _send_telegram(
-            f"Trade monitor crashed\n"
-            f"Option : `{opt_type} {strike}`\n"
-            f"Error  : `{exc}`"
+            "Trade monitor error\n"
+            f"Instrument: {trade['instrument_key']}\n"
+            f"Error: {exc}"
         )
+
     finally:
         with _trades_lock:
             try:
                 _active_trades.remove(trade)
             except ValueError:
                 pass
+
         if trade_closed:
-            print(f"[MONITOR] Trade closed ({opt_type} {strike}) — ready for next signal.\n")
+            print(f"[ORDER] Trade completed and cleared: {trade['instrument_key']}")
+            _try_send_daily_summary_for_day(trade_day)
         else:
-            print(f"[MONITOR] Monitor stopped ({opt_type} {strike}) — slot released for safety.\n")
+            print(f"[ORDER] Trade removed after monitor failure: {trade['instrument_key']}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Public entry point  (called by websocket.py on every fresh SBT signal)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def place_option_order(signal: str, nifty_ltp: float, signal_time: str):
     """
-    Called by websocket.py when the SBT strategy fires a new signal
-    on the latest closed 1-min NIFTY candle.
+    Called by websocket.py on each fresh signal.
 
-    Parameters
-    ----------
-    signal      : 'LONG' or 'SHORT'
-    nifty_ltp   : NIFTY close price on the signal candle
-    signal_time : human-readable timestamp string
-
-    Behaviour
-    ---------
-    LONG  →  Virtual/Real BUY  CE (Call)  at ATM strike
-    SHORT →  Virtual/Real BUY  PE (Put)   at ATM strike
-
-    Multiple concurrent trades are allowed; every fresh signal spawns
-    its own independent monitor thread with no blocking guard.
+    This function resolves the option contract, creates the trade,
+    and starts a dedicated option websocket monitor thread for that trade.
     """
-    signal_time = _format_ist_timestamp(signal_time)
+    _ensure_daily_summary_worker_started()
+
+    signal = signal.upper().strip()
+    if signal not in {"LONG", "SHORT"}:
+        print(f"[ORDER] Unsupported signal: {signal}")
+        return
 
     option_type = "CE" if signal == "LONG" else "PE"
-    mode_tag    = "[VIRTUAL]" if VIRTUAL_MODE else "[LIVE]"
+    signal_time_fmt = _format_ist_timestamp(signal_time)
 
     with _trades_lock:
         active_count = len(_active_trades)
 
-    print(f"\n{'='*62}")
-    print(f"  {mode_tag}  NEW SIGNAL : {signal}  →  {option_type}  |  {signal_time}")
-    print(f"  Active trades currently running: {active_count}")
-    print(f"{'='*62}")
+    print("=" * 70)
+    print(
+        f"[ORDER] New signal={signal} option={option_type} "
+        f"time={signal_time_fmt} active_trades={active_count}"
+    )
+    print("=" * 70)
 
     try:
-        # 1. Resolve option contract
-        instr_key, strike, chain_ltp, expiry = get_option_instrument_key(
-            nifty_ltp, option_type
-        )
-        print(
-            f"[ORDER] Contract → NIFTY {strike} {option_type}  "
-            f"Expiry={expiry}  Chain LTP=₹{chain_ltp:.2f}\n"
-            f"[ORDER] Instrument key: {instr_key}"
-        )
+        instrument_key, strike, chain_ltp, expiry_date = get_option_instrument_key(nifty_ltp, option_type)
 
-        # 2. Fetch live LTP for entry price
-        live_ltp    = get_option_ltp(instr_key)
+        live_ltp = get_option_ltp(instrument_key)
         entry_price = live_ltp if live_ltp > 0 else chain_ltp
-        print(f"[ORDER] Entry price = ₹{entry_price:.2f}")
+        if entry_price <= 0:
+            raise RuntimeError("Entry price could not be determined from chain/live quote.")
 
-        # 3. Place order (virtual or real)
         if VIRTUAL_MODE:
             order_id = f"VIRTUAL-{_ist_now().strftime('%H%M%S%f')[:13]}"
-            print(f"[ORDER] {mode_tag} BUY  NIFTY {strike} {option_type}  "
-                  f"Qty={LOT_SIZE}  Price=₹{entry_price:.2f}  "
-                  f"ref={order_id}")
+            print(
+                f"[ORDER] VIRTUAL BUY {option_type} {strike} Qty={LOT_SIZE} "
+                f"Entry=Rs {entry_price:.2f} Ref={order_id}"
+            )
         else:
-            order_id = _place_real_order(instr_key, transaction_type="BUY")
+            order_id = _place_real_order(instrument_key, transaction_type="BUY")
+            print(f"[ORDER] LIVE BUY order placed: {order_id}")
 
-        # 4. Store trade record and register it in the active list
         trade = {
-            "instrument_key": instr_key,
-            "strike":         strike,
-            "option_type":    option_type,
-            "expiry_date":    expiry,
-            "entry_price":    entry_price,
-            "order_id":       order_id,
-            "signal":         signal,
-            "signal_time":    signal_time,
+            "instrument_key": instrument_key,
+            "strike": strike,
+            "option_type": option_type,
+            "expiry_date": expiry_date,
+            "entry_price": float(entry_price),
+            "order_id": order_id,
+            "signal": signal,
+            "signal_time": signal_time_fmt,
+            "entry_ts": _ist_now().replace(tzinfo=None),
         }
+
         with _trades_lock:
             _active_trades.append(trade)
 
-        # 5. Alert 1 — Signal + entry details
-        _alert_signal_entry(
-            signal      = signal,
-            option_type = option_type,
-            strike      = strike,
-            instr_key   = instr_key,
-            entry_price = entry_price,
-            expiry      = expiry,
-            signal_time = signal_time,
-        )
+        _send_trade_entry_alert(trade)
 
-        # 6. Start background monitor (1-min option candles)
-        t = threading.Thread(
-            target = _monitor_trade,
-            args   = (trade,),
-            daemon = True,
-            name   = f"monitor-{option_type}{strike}-{order_id[-6:]}",
+        worker = threading.Thread(
+            target=_monitor_trade_worker,
+            args=(trade,),
+            daemon=True,
+            name=f"option-ws-{option_type}{strike}-{order_id[-6:]}",
         )
-        t.start()
-        print(f"[ORDER] Monitor thread '{t.name}' started.\n")
+        worker.start()
+        print(f"[ORDER] Started option websocket monitor thread: {worker.name}")
 
     except Exception as exc:
-        print(f"[ORDER] ❌ Failed: {exc}")
+        print(f"[ORDER] Failed to start trade: {exc}")
         _send_telegram(
-            f"❌ *Order Setup FAILED* {mode_tag}\n"
-            f"Signal : `{signal}`\n"
-            f"NIFTY  : `{nifty_ltp:.2f}`\n"
-            f"Error  : `{exc}`"
+            "Order setup failed\n"
+            f"Signal: {signal}\n"
+            f"Nifty LTP: {nifty_ltp:.2f}\n"
+            f"Error: {exc}"
         )
+
+
+_ensure_daily_summary_worker_started()
